@@ -1,6 +1,6 @@
 import type { AnyRoleName } from "@shared";
 import { and, count, eq, ilike, inArray, or } from "drizzle-orm";
-import db, { schema } from "@/database";
+import db, { schema, type Transaction } from "@/database";
 import { createPaginatedResult } from "@/database/utils/pagination";
 import logger from "@/logging";
 
@@ -101,9 +101,13 @@ class MemberModel {
    * Count memberships for a user across all organizations
    * Used to check if user should be deleted after member removal
    */
-  static async countByUserId(userId: string): Promise<number> {
+  static async countByUserId(
+    userId: string,
+    tx?: Transaction,
+  ): Promise<number> {
     logger.debug({ userId }, "MemberModel.countByUserId: counting memberships");
-    const [result] = await db
+    const dbOrTx = tx ?? db;
+    const [result] = await dbOrTx
       .select({ count: count() })
       .from(schema.membersTable)
       .where(eq(schema.membersTable.userId, userId));
@@ -118,12 +122,15 @@ class MemberModel {
   /**
    * Check if a user has any memberships remaining
    */
-  static async hasAnyMembership(userId: string): Promise<boolean> {
+  static async hasAnyMembership(
+    userId: string,
+    tx?: Transaction,
+  ): Promise<boolean> {
     logger.debug(
       { userId },
       "MemberModel.hasAnyMembership: checking for memberships",
     );
-    const memberCount = await MemberModel.countByUserId(userId);
+    const memberCount = await MemberModel.countByUserId(userId, tx);
     const hasMembership = memberCount > 0;
     logger.debug(
       { userId, hasMembership },
@@ -187,6 +194,39 @@ class MemberModel {
       "MemberModel.findAllByOrganization: completed",
     );
     return results;
+  }
+
+  /**
+   * List org members eligible to be impersonated by an admin: excludes a
+   * given user (typically the caller) and excludes anyone whose system-level
+   * `user.role` is "admin" (better-auth's adminRoles guard would reject
+   * those at impersonation time anyway).
+   */
+  static async findImpersonationCandidates(params: {
+    organizationId: string;
+    excludeUserId: string;
+  }) {
+    const rows = await db
+      .select({
+        id: schema.usersTable.id,
+        name: schema.usersTable.name,
+        email: schema.usersTable.email,
+        role: schema.membersTable.role,
+        systemRole: schema.usersTable.role,
+      })
+      .from(schema.membersTable)
+      .innerJoin(
+        schema.usersTable,
+        eq(schema.membersTable.userId, schema.usersTable.id),
+      )
+      .where(eq(schema.membersTable.organizationId, params.organizationId))
+      .orderBy(schema.usersTable.name);
+
+    return rows
+      .filter(
+        (row) => row.id !== params.excludeUserId && row.systemRole !== "admin",
+      )
+      .map(({ systemRole: _systemRole, ...rest }) => rest);
   }
 
   static async findUserIdsInOrganization(params: {
@@ -312,20 +352,22 @@ class MemberModel {
   static async deleteByMemberOrUserId(
     memberIdOrUserId: string,
     organizationId: string,
+    tx?: Transaction,
   ) {
     logger.debug(
       { memberIdOrUserId, organizationId },
       "MemberModel.deleteByMemberOrUserId: deleting member",
     );
+    const dbOrTx = tx ?? db;
     // Try to delete by member ID first
-    let deleted = await db
+    let deleted = await dbOrTx
       .delete(schema.membersTable)
       .where(eq(schema.membersTable.id, memberIdOrUserId))
       .returning();
 
     // If not found, try by user ID + organization ID
     if (!deleted[0] && organizationId) {
-      deleted = await db
+      deleted = await dbOrTx
         .delete(schema.membersTable)
         .where(
           and(

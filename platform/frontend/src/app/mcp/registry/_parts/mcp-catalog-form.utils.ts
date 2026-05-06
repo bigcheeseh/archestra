@@ -20,6 +20,8 @@ export function transformFormToApiData(
     name: values.name,
     description: values.description || null,
     serverType: values.serverType,
+    multitenant:
+      values.serverType === "local" ? Boolean(values.multitenant) : false,
     icon: values.icon ?? null,
   };
 
@@ -88,12 +90,7 @@ export function transformFormToApiData(
       .split(",")
       .map((scope) => scope.trim())
       .filter((scope) => scope.length > 0);
-    const hasExplicitScopes = parsedScopes.length > 0;
-    const scopesList = hasExplicitScopes
-      ? parsedScopes
-      : isClientCredentials
-        ? []
-        : ["read", "write"];
+    const scopesList = parsedScopes;
 
     // For local servers, use oauthServerUrl; for remote servers, use serverUrl
     const oauthServerUrl =
@@ -125,13 +122,21 @@ export function transformFormToApiData(
       audience: values.oauthConfig.audience || undefined,
       redirect_uris: redirectUrisList,
       scopes: scopesList,
-      // Keep fallback scopes aligned with explicit scopes because the backend
-      // skips discovery entirely when scopes are configured.
-      default_scopes: hasExplicitScopes
-        ? scopesList
-        : isClientCredentials
-          ? []
-          : ["read", "write"],
+      // default_scopes is the fallback used by the backend's scope resolution:
+      //   1. If `scopes` is non-empty, discovery is skipped and `scopes` is sent verbatim.
+      //   2. If `scopes` is empty, backend tries .well-known discovery
+      //      (oauth-protected-resource, then oauth-authorization-server).
+      //   3. If discovery yields nothing, backend falls back to `default_scopes`.
+      // When the user configures explicit scopes, mirror them into default_scopes so
+      // the fallback matches intent. When the field is blank, keep the generic
+      // ["read","write"] fallback — some proxy MCP servers (e.g. Atlassian) accept
+      // those literal values and translate them to real provider scopes.
+      default_scopes:
+        scopesList.length > 0
+          ? scopesList
+          : isClientCredentials
+            ? []
+            : ["read", "write"],
       supports_resource_metadata: values.oauthConfig.supports_resource_metadata,
     };
 
@@ -143,6 +148,7 @@ export function transformFormToApiData(
 
     data.userConfig = isClientCredentials
       ? {
+          ...buildStaticHeaderUserConfig(values),
           client_id: {
             type: "string",
             title: "Client ID",
@@ -173,10 +179,10 @@ export function transformFormToApiData(
             sensitive: false,
           },
         }
-      : {};
+      : buildStaticHeaderUserConfig(values);
     data.enterpriseManagedConfig = null;
   } else if (values.authMethod === "enterprise_managed") {
-    data.userConfig = {};
+    data.userConfig = buildStaticHeaderUserConfig(values);
     data.oauthConfig = null;
     data.enterpriseManagedConfig = values.enterpriseManagedConfig
       ? {
@@ -185,7 +191,7 @@ export function transformFormToApiData(
         }
       : null;
   } else if (values.authMethod === "idp_jwt") {
-    data.userConfig = {};
+    data.userConfig = buildStaticHeaderUserConfig(values);
     data.oauthConfig = null;
     data.enterpriseManagedConfig = values.enterpriseManagedConfig
       ? {
@@ -266,6 +272,16 @@ export function transformCatalogItemToFormValues(
     item.name.includes("github")
   ) {
     authMethod = "bearer";
+  } else if (
+    Object.entries(item.userConfig ?? {}).some(
+      ([fieldName, config]) =>
+        fieldName !== "access_token" &&
+        fieldName !== "raw_access_token" &&
+        (config as { valuePrefix?: string } | undefined)?.valuePrefix ===
+          "Bearer ",
+    )
+  ) {
+    authMethod = "auth_header";
   }
 
   // Check if OAuth client_secret is a BYOS vault reference
@@ -427,6 +443,7 @@ export function transformCatalogItemToFormValues(
       required: config.required ?? false,
       value: typeof config.default === "string" ? config.default : undefined,
       description: config.description ?? "",
+      includeBearerPrefix: config.valuePrefix === "Bearer ",
     }));
 
   return {
@@ -434,6 +451,7 @@ export function transformCatalogItemToFormValues(
     description: item.description || "",
     icon: item.icon ?? null,
     serverType: item.serverType as "remote" | "local",
+    multitenant: item.serverType === "local" && Boolean(item.multitenant),
     serverUrl: item.serverUrl || "",
     authMethod,
     includeBearerPrefix,
@@ -542,7 +560,7 @@ export function transformExternalCatalogToFormValues(
         (typeof window !== "undefined"
           ? `${window.location.origin}/oauth-callback`
           : ""),
-      scopes: server.oauth_config.scopes?.join(", ") || "read, write",
+      scopes: server.oauth_config.scopes?.join(", ") ?? "",
       supports_resource_metadata:
         server.oauth_config.supports_resource_metadata ?? true,
       grantType:
@@ -686,6 +704,7 @@ export function transformExternalCatalogToFormValues(
     description: server.description || "",
     icon: server.icon ?? null,
     serverType: server.server.type as "remote" | "local",
+    multitenant: server.server.type === "local" && authMethod !== "none",
     serverUrl: server.server.type === "remote" ? server.server.url : "",
     authMethod,
     includeBearerPrefix,
@@ -705,6 +724,7 @@ export function transformExternalCatalogToFormValues(
         required: config.required ?? false,
         value: typeof config.default === "string" ? config.default : undefined,
         description: config.description ?? "",
+        includeBearerPrefix: config.valuePrefix === "Bearer ",
       })),
     oauthConfig: oauthConfig ?? {
       client_id: "",
@@ -778,9 +798,13 @@ function buildStaticHeaderUserConfig(
       default:
         !header.promptOnInstallation && header.value ? header.value : undefined,
       description:
-        header.description || `Additional header sent as ${header.headerName}`,
+        header.description ||
+        (header.includeBearerPrefix
+          ? `Sent as ${header.headerName} with a "Bearer " prefix`
+          : `Sent as ${header.headerName}`),
       sensitive: false,
       headerName: header.headerName,
+      valuePrefix: header.includeBearerPrefix ? "Bearer " : undefined,
     };
   }
 
@@ -827,6 +851,7 @@ function getHeaderMappedUserConfigEntries(
     required?: boolean;
     default?: string | number | boolean | Array<string>;
     description?: string;
+    valuePrefix?: string;
   }
 > {
   return Object.fromEntries(
@@ -844,6 +869,7 @@ function getHeaderMappedUserConfigEntries(
           required?: boolean;
           default?: string | number | boolean | Array<string>;
           description?: string;
+          valuePrefix?: string;
         };
         return [
           fieldName,
@@ -854,6 +880,7 @@ function getHeaderMappedUserConfigEntries(
             required: userConfigField.required,
             default: userConfigField.default,
             description: userConfigField.description,
+            valuePrefix: userConfigField.valuePrefix,
           },
         ];
       }),

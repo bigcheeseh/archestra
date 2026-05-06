@@ -41,6 +41,7 @@ import { ChatLinkButton } from "@/components/chat/chat-help-link";
 import { ChatMessages } from "@/components/chat/chat-messages";
 import { ConversationArtifactPanel } from "@/components/chat/conversation-artifact";
 import { InitialAgentSelector } from "@/components/chat/initial-agent-selector";
+import { OnboardingWizardButton } from "@/components/chat/onboarding-wizard-button";
 import {
   PlaywrightInstallDialog,
   usePlaywrightSetupRequired,
@@ -133,6 +134,7 @@ import { cn } from "@/lib/utils";
 import {
   buildCreateConversationInput,
   resolveChatModelState,
+  resolveInitialAgentSelection,
   resolveInitialAgentState,
   resolvePreferredModelForProvider,
   shouldResetInitialChatState,
@@ -208,15 +210,16 @@ export function ChatPageContent({
   const { data: canReadLlmModels } = useHasPermissions({
     llmModel: ["read"],
   });
-  const { data: canSeeProviderSettings } = useHasPermissions({
-    chatProviderSettings: ["enable"],
-  });
   const { data: canReadTeams } = useHasPermissions({
     team: ["read"],
   });
   const { data: canUpdateAgent } = useHasPermissions({
     agent: ["team-admin"],
   });
+  const { data: canSeeAgentPicker, isLoading: isAgentPickerPermissionLoading } =
+    useHasPermissions({
+      chatAgentPicker: ["enable"],
+    });
   const { data: teams } = useTeams({ enabled: !!canReadTeams });
 
   // Non-admin users with no teams cannot create agents
@@ -235,9 +238,7 @@ export function ChatPageContent({
 
   const hasChatAccess = canReadAgent !== false;
   const canUseProviderSettings =
-    canSeeProviderSettings === true &&
-    canReadLlmProvider === true &&
-    canReadLlmModels === true;
+    canReadLlmProvider === true && canReadLlmModels === true;
 
   // Fetch internal agents for dialog editing
   const { data: internalAgents = [], isPending: isLoadingAgents } =
@@ -317,42 +318,26 @@ export function ChatPageContent({
       }
     }
 
-    // Priority: org default > localStorage > member default > first available
+    // Priority: org default > localStorage > member default > first available.
     // Org default always wins when set (admin-configured for the whole org).
-    // localStorage only overrides when no org default is configured.
+    // localStorage only overrides when no org default is configured and the
+    // user can change agents; otherwise a stale hidden picker value can trap
+    // restricted users on a previously swapped agent.
     // Also skip if a URL param was consumed but state hasn't flushed yet.
     if (!initialAgentId && !urlParamsConsumedRef.current) {
-      // Try org's default agent first (admin-configured, takes precedence)
-      if (organization?.defaultAgentId) {
-        const orgDefaultAgent = internalAgents.find(
-          (a) => a.id === organization.defaultAgentId,
-        );
-        if (orgDefaultAgent) {
-          applyInitialAgentSelection(orgDefaultAgent);
-          saveAgent(organization.defaultAgentId);
-          return;
-        }
-      }
-      // Try localStorage (user's previous selection, only when no org default)
-      const savedAgentId = getSavedAgent();
-      const savedAgent = internalAgents.find((a) => a.id === savedAgentId);
-      if (savedAgent) {
-        applyInitialAgentSelection(savedAgent);
-        return;
-      }
-      // Try member's default agent
-      if (defaultAgentId) {
-        const defaultAgent = internalAgents.find(
-          (a) => a.id === defaultAgentId,
-        );
-        if (defaultAgent) {
-          applyInitialAgentSelection(defaultAgent);
-          saveAgent(defaultAgentId);
-          return;
-        }
-      }
-      applyInitialAgentSelection(internalAgents[0]);
-      saveAgent(internalAgents[0].id);
+      if (isAgentPickerPermissionLoading) return;
+
+      const selectedAgent = resolveInitialAgentSelection({
+        agents: internalAgents,
+        organizationDefaultAgentId: organization?.defaultAgentId,
+        savedAgentId: getSavedAgent(),
+        memberDefaultAgentId: defaultAgentId,
+        canUseSavedAgent: canSeeAgentPicker === true,
+      });
+      if (!selectedAgent) return;
+
+      applyInitialAgentSelection(selectedAgent);
+      saveAgent(selectedAgent.id);
     }
   }, [
     applyInitialAgentSelection,
@@ -362,6 +347,8 @@ export function ChatPageContent({
     defaultAgentId,
     organization?.defaultAgentId,
     isOrgLoading,
+    canSeeAgentPicker,
+    isAgentPickerPermissionLoading,
   ]);
 
   // Initialize model and API key once agent is resolved.
@@ -840,12 +827,24 @@ export function ChatPageContent({
   // While a conversation tab is open, useChat owns the thread.
   // We only fall back to persisted messages before the session initializes or
   // for read-only shared conversations that do not create a live chat session.
-  const messages = chatSession?.messages ?? persistedConversationMessages;
+  const messages = useMemo(
+    () =>
+      chatSession?.messages
+        ? mergePersistedMessageMetadata({
+            liveMessages: chatSession.messages,
+            persistedMessages: persistedConversationMessages,
+          })
+        : persistedConversationMessages,
+    [chatSession?.messages, persistedConversationMessages],
+  );
   const sendMessage = chatSession?.sendMessage;
   const status = chatSession?.status ?? "ready";
   const setMessages = chatSession?.setMessages;
   const stop = chatSession?.stop;
-  const error = chatSession?.error;
+  const error =
+    status === "submitted" || status === "streaming"
+      ? undefined
+      : chatSession?.error;
   const addToolResult = chatSession?.addToolResult;
   const addToolApprovalResponse = chatSession?.addToolApprovalResponse;
   const pendingCustomServerToolCall = chatSession?.pendingCustomServerToolCall;
@@ -1025,6 +1024,7 @@ export function ChatPageContent({
     sendMessage({
       role: "user",
       parts,
+      metadata: { createdAt: new Date().toISOString() },
     });
   }, [
     conversation,
@@ -1156,6 +1156,7 @@ export function ChatPageContent({
     sendMessage?.({
       role: "user",
       parts,
+      metadata: { createdAt: new Date().toISOString() },
     });
   };
 
@@ -1402,6 +1403,7 @@ export function ChatPageContent({
     sendMessage({
       role: "user",
       parts: [{ type: "text", text: pendingReauthResume.message }],
+      metadata: { createdAt: new Date().toISOString() },
     });
   }, [conversationId, sendMessage, status]);
 
@@ -1469,13 +1471,13 @@ export function ChatPageContent({
                   : "You don't have permission to create agents"
               }
             >
-              <Plus className="mr-2 h-4 w-4" />
+              <Plus className="h-4 w-4" />
               Create Agent
             </ButtonWithTooltip>
           ) : (
             <Button asChild>
               <Link href="/agents?create=true">
-                <Plus className="mr-2 h-4 w-4" />
+                <Plus className="h-4 w-4" />
                 Create Agent
               </Link>
             </Button>
@@ -1742,6 +1744,7 @@ export function ChatPageContent({
                     }
                     selectedModel={conversation?.selectedModel ?? initialModel}
                     modelSource={conversationModelSource ?? initialModelSource}
+                    chatErrors={conversation?.chatErrors ?? []}
                     onUserMessageEdit={(
                       editedMessage,
                       updatedMessages,
@@ -1760,6 +1763,7 @@ export function ChatPageContent({
                           sendMessage({
                             role: "user",
                             parts: [{ type: "text", text: editedText }],
+                            metadata: { createdAt: new Date().toISOString() },
                           });
                         }
                       }
@@ -1813,7 +1817,7 @@ export function ChatPageContent({
                             void handleForkSharedConversation();
                           }}
                         >
-                          <Plus className="h-4 w-4 mr-2" />
+                          <Plus className="h-4 w-4" />
                           Start New Chat from here
                         </Button>
                       </div>
@@ -1835,7 +1839,7 @@ export function ChatPageContent({
                         </span>
                       </div>
                       <Button onClick={() => router.push("/chat")}>
-                        <Plus className="h-4 w-4 mr-2" />
+                        <Plus className="h-4 w-4" />
                         New Conversation
                       </Button>
                     </div>
@@ -1905,18 +1909,23 @@ export function ChatPageContent({
                   }
                 }}
               >
-                {organization?.chatLinks &&
-                  organization.chatLinks.length > 0 && (
-                    <div className="absolute top-4 right-4 z-10 flex flex-wrap justify-end gap-2 max-w-[min(100%,36rem)]">
-                      {organization.chatLinks.map((link) => (
-                        <ChatLinkButton
-                          key={`${link.label}-${link.url}`}
-                          url={link.url}
-                          label={link.label}
-                        />
-                      ))}
-                    </div>
-                  )}
+                {((organization?.chatLinks?.length ?? 0) > 0 ||
+                  organization?.onboardingWizard) && (
+                  <div className="absolute top-4 right-4 z-10 flex flex-wrap justify-end gap-2 max-w-[min(100%,36rem)]">
+                    {organization?.chatLinks?.map((link) => (
+                      <ChatLinkButton
+                        key={`link-${link.label}-${link.url}`}
+                        url={link.url}
+                        label={link.label}
+                      />
+                    ))}
+                    {organization?.onboardingWizard && (
+                      <OnboardingWizardButton
+                        wizard={organization.onboardingWizard}
+                      />
+                    )}
+                  </div>
+                )}
                 {isPlaywrightSetupRequired && canUpdateAgent && (
                   <PlaywrightInstallDialog
                     agentId={playwrightSetupAgentId}
@@ -2094,19 +2103,78 @@ export default function ChatPage() {
   return <ChatPageContent key="new-chat" />;
 }
 
+function mergePersistedMessageMetadata(params: {
+  liveMessages: UIMessage[];
+  persistedMessages: UIMessage[];
+}): UIMessage[] {
+  const remainingPersistedMessages = [...params.persistedMessages];
+
+  return params.liveMessages.map((liveMessage) => {
+    if (hasCreatedAtMetadata(liveMessage)) {
+      return liveMessage;
+    }
+
+    const persistedIndex = remainingPersistedMessages.findIndex(
+      (persistedMessage) =>
+        messagesHaveSameRenderableContent({
+          liveMessage,
+          persistedMessage,
+        }),
+    );
+
+    if (persistedIndex === -1) {
+      return liveMessage;
+    }
+
+    const [persistedMessage] = remainingPersistedMessages.splice(
+      persistedIndex,
+      1,
+    );
+
+    return {
+      ...liveMessage,
+      metadata: {
+        ...getObjectMetadata(persistedMessage),
+        ...getObjectMetadata(liveMessage),
+      },
+    };
+  });
+}
+
+function messagesHaveSameRenderableContent(params: {
+  liveMessage: UIMessage;
+  persistedMessage: UIMessage;
+}) {
+  return (
+    params.liveMessage.role === params.persistedMessage.role &&
+    getMessageText(params.liveMessage) ===
+      getMessageText(params.persistedMessage)
+  );
+}
+
+function getMessageText(message: UIMessage) {
+  return message.parts
+    .filter((part) => part.type === "text")
+    .map((part) => part.text)
+    .join("\n");
+}
+
+function hasCreatedAtMetadata(message: UIMessage) {
+  const metadata = getObjectMetadata(message);
+  return typeof metadata.createdAt === "string";
+}
+
+function getObjectMetadata(message: UIMessage): Record<string, unknown> {
+  return typeof message.metadata === "object" && message.metadata !== null
+    ? { ...message.metadata }
+    : {};
+}
+
 // =========================================================================
 // No API Key Setup — shown when user has no API keys configured
 // =========================================================================
 
-const DEFAULT_FORM_VALUES: LlmProviderApiKeyFormValues = {
-  name: "",
-  provider: "anthropic",
-  apiKey: null,
-  baseUrl: null,
-  scope: "personal",
-  teamId: null,
-  vaultSecretPath: null,
-  vaultSecretKey: null,
+const DEFAULT_FORM_VALUES: Partial<LlmProviderApiKeyFormValues> = {
   isPrimary: true,
 };
 
@@ -2127,7 +2195,7 @@ function NoApiKeySetup() {
           data-testid={E2eTestId.QuickstartAddApiKeyButton}
           onClick={() => setIsDialogOpen(true)}
         >
-          <Plus className="h-4 w-4 mr-2" />
+          <Plus className="h-4 w-4" />
           Add API Key
         </Button>
       </div>

@@ -4,12 +4,16 @@ import {
   TOOL_SWAP_AGENT_SHORT_NAME,
   TOOL_SWAP_TO_DEFAULT_AGENT_SHORT_NAME,
   TOOL_TODO_WRITE_SHORT_NAME,
+  type ToolStateMcpToolError,
+  ToolStateMcpToolErrorSchema,
 } from "@shared";
 import { z } from "zod";
 import { isAgentTypeAdmin } from "@/auth/agent-type-permissions";
 import logger from "@/logging";
 import {
   AgentModel,
+  ChatOpsChannelBindingModel,
+  ChatOpsThreadAgentOverrideModel,
   ConversationModel,
   OrganizationModel,
   ScheduleTriggerRunModel,
@@ -22,6 +26,7 @@ import {
   EmptyToolArgsSchema,
   errorResult,
   structuredSuccessResult,
+  structuredToolErrorResult,
 } from "./helpers";
 import type { ArchestraContext } from "./types";
 
@@ -48,11 +53,31 @@ const TodoWriteOutputSchema = z.object({
     .describe("How many todo items were written."),
 });
 
-const SwapAgentOutputSchema = z.object({
-  success: z.literal(true).describe("Whether the swap succeeded."),
-  agent_id: z.string().describe("The agent ID the conversation now uses."),
-  agent_name: z.string().describe("The agent name the conversation now uses."),
-});
+const SwapAgentStateCodeSchema = z.enum([
+  "no_agent_found",
+  "already_using_agent",
+  "no_default_agent",
+  "default_agent_not_found",
+  "already_using_default_agent",
+]);
+
+const SwapAgentOutputSchema = z.discriminatedUnion("success", [
+  z.object({
+    success: z.literal(true).describe("Whether the swap succeeded."),
+    agent_id: z.string().describe("The agent ID the conversation now uses."),
+    agent_name: z
+      .string()
+      .describe("The agent name the conversation now uses."),
+  }),
+  z.object({
+    success: z.literal(false).describe("Whether the swap succeeded."),
+    code: SwapAgentStateCodeSchema.describe("Why the swap was not applied."),
+    message: z.string().describe("Human-readable explanation."),
+    archestraError: ToolStateMcpToolErrorSchema,
+  }),
+]);
+
+type SwapAgentStateCode = z.infer<typeof SwapAgentStateCodeSchema>;
 
 const ArtifactWriteOutputSchema = z.object({
   success: z.literal(true).describe("Whether the artifact write succeeded."),
@@ -209,14 +234,43 @@ const registry = defineArchestraTools([
   }),
 ] as const);
 
-export const toolShortNames = registry.toolShortNames;
-export const toolArgsSchemas = registry.toolArgsSchemas;
-export const toolOutputSchemas = registry.toolOutputSchemas;
 export const toolEntries = registry.toolEntries;
 
 // === Exports ===
 
 export const tools = registry.tools;
+
+function swapAgentStateResult(params: {
+  code: SwapAgentStateCode;
+  message: string;
+  toolName: string;
+}): CallToolResult {
+  const archestraError: ToolStateMcpToolError = {
+    type: "tool_state",
+    code: params.code,
+    message: params.message,
+    toolName: params.toolName,
+  };
+
+  return structuredToolErrorResult({
+    error: archestraError,
+    text: JSON.stringify({
+      success: false,
+      code: params.code,
+      message: params.message,
+      archestraError,
+    }),
+    structuredContent: {
+      success: false,
+      code: params.code,
+      message: params.message,
+    },
+    // These are expected chat-routing states, not MCP transport failures. Keep
+    // isError false so the agent can respond normally instead of surfacing a
+    // global chat error.
+    isError: false,
+  });
+}
 
 async function handleSwapAgent(params: {
   agentName: string;
@@ -225,14 +279,27 @@ async function handleSwapAgent(params: {
   const { agentName, context } = params;
   const { agent: contextAgent } = context;
   logger.info(
-    { agentId: contextAgent.id, agentName },
+    {
+      agentId: contextAgent.id,
+      agentName,
+      chatOpsBindingId: context.chatOpsBindingId ?? null,
+      conversationId: context.conversationId ?? null,
+    },
     "swap_agent tool called",
   );
 
   try {
-    if (!context.conversationId || !context.userId || !context.organizationId) {
+    if (!context.userId || !context.organizationId) {
       return errorResult(
-        "This tool requires conversation context. It can only be used within an active chat conversation.",
+        "This tool requires user and organization context. It can only be used within an authenticated chat session.",
+      );
+    }
+
+    const hasConversationContext = Boolean(context.conversationId);
+    const hasChatOpsContext = Boolean(context.chatOpsBindingId);
+    if (!hasConversationContext && !hasChatOpsContext) {
+      return errorResult(
+        "This tool requires conversation context. It can only be used within an active chat conversation or chatops channel.",
       );
     }
 
@@ -263,7 +330,11 @@ async function handleSwapAgent(params: {
     );
 
     if (results.data.length === 0) {
-      return errorResult(`No agent found matching "${agentName}".`);
+      return swapAgentStateResult({
+        code: "no_agent_found",
+        message: `No agent found matching "${agentName}".`,
+        toolName: TOOL_SWAP_AGENT_SHORT_NAME,
+      });
     }
 
     // Pick exact name match if available, otherwise first result
@@ -274,36 +345,90 @@ async function handleSwapAgent(params: {
 
     // Prevent swapping to the same agent
     if (targetAgent.id === contextAgent.id) {
-      return errorResult(
-        `Already using agent "${targetAgent.name}". Choose a different agent.`,
-      );
+      return swapAgentStateResult({
+        code: "already_using_agent",
+        message: `Already using agent "${targetAgent.name}". Choose a different agent.`,
+        toolName: TOOL_SWAP_AGENT_SHORT_NAME,
+      });
     }
 
-    const llmSelection = await resolveConversationLlmSelectionForAgent({
-      agent: {
-        llmApiKeyId: targetAgent.llmApiKeyId ?? null,
-        llmModel: targetAgent.llmModel ?? null,
-      },
-      organizationId: context.organizationId,
-      userId: context.userId,
-    });
+    // In chatops-triggered A2A runs we can have both:
+    // - chatOpsBindingId: real channel binding context
+    // - conversationId: synthetic isolation key for tool/session caching
+    // Prefer the chatops binding whenever available.
+    if (context.chatOpsBindingId) {
+      if (!context.chatOpsThreadId) {
+        return errorResult(
+          "This tool requires thread context in chatops. Cannot determine which thread to swap.",
+        );
+      }
 
-    // Update the conversation's agent and LLM selection together so the
-    // follow-up response uses the new agent's model/key immediately.
-    const updated = await ConversationModel.update(
-      context.conversationId,
-      context.userId,
-      context.organizationId,
-      {
-        agentId: targetAgent.id,
-        chatApiKeyId: llmSelection.chatApiKeyId,
-        selectedModel: llmSelection.selectedModel,
-        selectedProvider: llmSelection.selectedProvider,
-      },
-    );
+      // Validate binding exists and user has permission
+      const binding = await ChatOpsChannelBindingModel.findById(
+        context.chatOpsBindingId,
+      );
+      if (!binding || binding.organizationId !== context.organizationId) {
+        return errorResult("Failed to update chatops channel agent.");
+      }
 
-    if (!updated) {
-      return errorResult("Failed to update conversation agent.");
+      // Personal agent scope check
+      if (targetAgent.scope === "personal") {
+        if (!binding.isDm) {
+          return errorResult(
+            "Personal agents cannot be assigned to channels. Use an org-scoped or team-scoped agent instead.",
+          );
+        }
+        if (targetAgent.authorId !== context.userId) {
+          return errorResult(
+            "You can only assign your own personal agents to your DM.",
+          );
+        }
+      }
+
+      // Write thread-scoped override instead of mutating channel binding
+      const override = await ChatOpsThreadAgentOverrideModel.upsert(
+        context.chatOpsBindingId,
+        context.chatOpsThreadId,
+        targetAgent.id,
+      );
+      if (!override) {
+        return errorResult("Failed to update chatops thread agent.");
+      }
+    } else if (context.conversationId) {
+      const llmSelection = await resolveConversationLlmSelectionForAgent({
+        agent: {
+          llmApiKeyId: targetAgent.llmApiKeyId ?? null,
+          llmModel: targetAgent.llmModel ?? null,
+        },
+        organizationId: context.organizationId,
+        userId: context.userId,
+      });
+
+      // Update the conversation's agent and LLM selection together so the
+      // follow-up response uses the new agent's model/key immediately.
+      const updated = await ConversationModel.update(
+        context.conversationId,
+        context.userId,
+        context.organizationId,
+        {
+          agentId: targetAgent.id,
+          chatApiKeyId: llmSelection.chatApiKeyId,
+          selectedModel: llmSelection.selectedModel,
+          selectedProvider: llmSelection.selectedProvider,
+        },
+      );
+      if (!updated) {
+        logger.warn(
+          {
+            conversationId: context.conversationId,
+            userId: context.userId,
+            organizationId: context.organizationId,
+            chatOpsBindingId: context.chatOpsBindingId ?? null,
+          },
+          "swap_agent: conversation update failed, possible missing chatOpsBindingId",
+        );
+        return errorResult("Failed to update conversation agent.");
+      }
     }
 
     return structuredSuccessResult(
@@ -326,14 +451,26 @@ async function handleSwapToDefaultAgent(params: {
   const { agent: contextAgent } = context;
 
   logger.info(
-    { agentId: contextAgent.id },
+    {
+      agentId: contextAgent.id,
+      chatOpsBindingId: context.chatOpsBindingId ?? null,
+      conversationId: context.conversationId ?? null,
+    },
     "swap_to_default_agent tool called",
   );
 
   try {
-    if (!context.conversationId || !context.userId || !context.organizationId) {
+    if (!context.userId || !context.organizationId) {
       return errorResult(
-        "This tool requires conversation context. It can only be used within an active chat conversation.",
+        "This tool requires user and organization context. It can only be used within an authenticated chat session.",
+      );
+    }
+
+    const hasConversationContext = Boolean(context.conversationId);
+    const hasChatOpsContext = Boolean(context.chatOpsBindingId);
+    if (!hasConversationContext && !hasChatOpsContext) {
+      return errorResult(
+        "This tool requires conversation context. It can only be used within an active chat conversation or chatops channel.",
       );
     }
 
@@ -341,45 +478,105 @@ async function handleSwapToDefaultAgent(params: {
     const defaultAgentId = org?.defaultAgentId ?? null;
 
     if (!defaultAgentId) {
-      return errorResult(
-        "No default agent is configured for this organization.",
-      );
+      return swapAgentStateResult({
+        code: "no_default_agent",
+        message: "No default agent is configured for this organization.",
+        toolName: TOOL_SWAP_TO_DEFAULT_AGENT_SHORT_NAME,
+      });
     }
 
     const targetAgent = await AgentModel.findById(defaultAgentId);
     if (!targetAgent) {
-      return errorResult("Default agent not found.");
+      return swapAgentStateResult({
+        code: "default_agent_not_found",
+        message: "Default agent not found.",
+        toolName: TOOL_SWAP_TO_DEFAULT_AGENT_SHORT_NAME,
+      });
     }
 
     if (targetAgent.id === contextAgent.id) {
-      return errorResult(
-        `Already using the default agent "${targetAgent.name}".`,
-      );
+      return swapAgentStateResult({
+        code: "already_using_default_agent",
+        message: `Already using the default agent "${targetAgent.name}".`,
+        toolName: TOOL_SWAP_TO_DEFAULT_AGENT_SHORT_NAME,
+      });
     }
 
-    const llmSelection = await resolveConversationLlmSelectionForAgent({
-      agent: {
-        llmApiKeyId: targetAgent.llmApiKeyId ?? null,
-        llmModel: targetAgent.llmModel ?? null,
-      },
-      organizationId: context.organizationId,
-      userId: context.userId,
-    });
+    // In chatops-triggered A2A runs we can have both:
+    // - chatOpsBindingId: real channel binding context
+    // - conversationId: synthetic isolation key for tool/session caching
+    // Prefer the chatops binding whenever available.
+    if (context.chatOpsBindingId) {
+      if (!context.chatOpsThreadId) {
+        return errorResult(
+          "This tool requires thread context in chatops. Cannot determine which thread to swap.",
+        );
+      }
 
-    const updated = await ConversationModel.update(
-      context.conversationId,
-      context.userId,
-      context.organizationId,
-      {
-        agentId: defaultAgentId,
-        chatApiKeyId: llmSelection.chatApiKeyId,
-        selectedModel: llmSelection.selectedModel,
-        selectedProvider: llmSelection.selectedProvider,
-      },
-    );
+      // Validate binding exists and user has permission
+      const binding = await ChatOpsChannelBindingModel.findById(
+        context.chatOpsBindingId,
+      );
+      if (!binding || binding.organizationId !== context.organizationId) {
+        return errorResult("Failed to update chatops channel agent.");
+      }
 
-    if (!updated) {
-      return errorResult("Failed to update conversation agent.");
+      // Personal agent scope check
+      if (targetAgent.scope === "personal") {
+        if (!binding.isDm) {
+          return errorResult(
+            "Personal agents cannot be assigned to channels. Use an org-scoped or team-scoped agent instead.",
+          );
+        }
+        if (targetAgent.authorId !== context.userId) {
+          return errorResult(
+            "You can only assign your own personal agents to your DM.",
+          );
+        }
+      }
+
+      // Write thread-scoped override instead of mutating channel binding
+      const override = await ChatOpsThreadAgentOverrideModel.upsert(
+        context.chatOpsBindingId,
+        context.chatOpsThreadId,
+        targetAgent.id,
+      );
+      if (!override) {
+        return errorResult("Failed to update chatops thread agent.");
+      }
+    } else if (context.conversationId) {
+      const llmSelection = await resolveConversationLlmSelectionForAgent({
+        agent: {
+          llmApiKeyId: targetAgent.llmApiKeyId ?? null,
+          llmModel: targetAgent.llmModel ?? null,
+        },
+        organizationId: context.organizationId,
+        userId: context.userId,
+      });
+
+      const updated = await ConversationModel.update(
+        context.conversationId,
+        context.userId,
+        context.organizationId,
+        {
+          agentId: defaultAgentId,
+          chatApiKeyId: llmSelection.chatApiKeyId,
+          selectedModel: llmSelection.selectedModel,
+          selectedProvider: llmSelection.selectedProvider,
+        },
+      );
+      if (!updated) {
+        logger.warn(
+          {
+            conversationId: context.conversationId,
+            userId: context.userId,
+            organizationId: context.organizationId,
+            chatOpsBindingId: context.chatOpsBindingId ?? null,
+          },
+          "swap_to_default_agent: conversation update failed, possible missing chatOpsBindingId",
+        );
+        return errorResult("Failed to update conversation agent.");
+      }
     }
 
     return structuredSuccessResult(

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { ConverseStreamOutput } from "@aws-sdk/client-bedrock-runtime";
+import { ArchestraInternalErrorCode, BedrockErrorTypes } from "@shared";
 import { EventStreamCodec } from "@smithy/eventstream-codec";
 import { fromUtf8, toUtf8 } from "@smithy/util-utf8";
 import { encode as toonEncode } from "@toon-format/toon";
@@ -87,6 +88,7 @@ const PADDING_ALPHABET =
 const BEDROCK_MAX_TOOL_NAME_LENGTH = 64;
 const TOOL_NAME_HASH_LENGTH = 8;
 const TOOL_NAME_HASH_SEPARATOR = "_";
+const BEDROCK_DOCUMENT_NAME_FALLBACK = "Document";
 const bedrockCommandContextCache = new WeakMap<
   BedrockRequest,
   BedrockCommandContext
@@ -285,6 +287,117 @@ function encodeProviderMessageToolNames(params: {
   }) as BedrockMessages;
 }
 
+// Applies all Bedrock provider-facing message rewrites before constructing the
+// AWS command input.
+function prepareProviderMessages(params: {
+  messages: BedrockMessages | undefined;
+  mapping: ToolNameMapping;
+  isNova: boolean;
+}): BedrockMessages | undefined {
+  const messagesWithEncodedToolNames = encodeProviderMessageToolNames(params);
+  return sanitizeProviderDocumentNames(messagesWithEncodedToolNames);
+}
+
+// Walks message content blocks and normalizes document names so Bedrock does
+// not reject otherwise valid file uploads on filename validation.
+function sanitizeProviderDocumentNames(
+  messages: BedrockMessages | undefined,
+): BedrockMessages | undefined {
+  if (!messages) {
+    return messages;
+  }
+
+  return messages.map((message) => {
+    if (!Array.isArray(message.content)) {
+      return message;
+    }
+
+    let changed = false;
+    const content = message.content.map((contentBlock) => {
+      const sanitizedContentBlock =
+        sanitizeDocumentNamesInContentBlock(contentBlock);
+      if (sanitizedContentBlock !== contentBlock) {
+        changed = true;
+      }
+      return sanitizedContentBlock;
+    });
+
+    return changed ? { ...message, content } : message;
+  }) as BedrockMessages;
+}
+
+// Sanitizes direct document blocks and document blocks nested inside tool
+// results while preserving unchanged content by reference.
+function sanitizeDocumentNamesInContentBlock(contentBlock: unknown): unknown {
+  if (isDocumentBlock(contentBlock)) {
+    const sanitizedName = sanitizeBedrockDocumentName(
+      contentBlock.document.name,
+    );
+    if (sanitizedName === contentBlock.document.name) {
+      return contentBlock;
+    }
+
+    return {
+      ...contentBlock,
+      document: {
+        ...contentBlock.document,
+        name: sanitizedName,
+      },
+    };
+  }
+
+  if (!isToolResultBlock(contentBlock)) {
+    return contentBlock;
+  }
+
+  const content = contentBlock.toolResult.content;
+  if (!Array.isArray(content)) {
+    return contentBlock;
+  }
+
+  let changed = false;
+  const sanitizedContent = content.map((item) => {
+    if (!isDocumentBlock(item)) {
+      return item;
+    }
+
+    const sanitizedName = sanitizeBedrockDocumentName(item.document.name);
+    if (sanitizedName === item.document.name) {
+      return item;
+    }
+
+    changed = true;
+    return {
+      ...item,
+      document: {
+        ...item.document,
+        name: sanitizedName,
+      },
+    };
+  });
+
+  return changed
+    ? {
+        ...contentBlock,
+        toolResult: {
+          ...contentBlock.toolResult,
+          content: sanitizedContent,
+        },
+      }
+    : contentBlock;
+}
+
+// Converts arbitrary filenames to Bedrock's document-name character set:
+// alphanumerics, whitespace, hyphens, parentheses, and square brackets.
+function sanitizeBedrockDocumentName(name: string): string {
+  const sanitizedName = name
+    .replace(/[^a-zA-Z0-9\s()[\]-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return sanitizedName || BEDROCK_DOCUMENT_NAME_FALLBACK;
+}
+
 function encodeProviderToolChoiceName(params: {
   toolChoice: Bedrock.Types.ToolChoice | undefined;
   mapping: ToolNameMapping;
@@ -353,6 +466,24 @@ function isToolResultBlock(block: unknown): block is {
     block !== null &&
     "toolResult" in block &&
     (block as { toolResult: unknown }).toolResult !== undefined
+  );
+}
+
+// Narrows a loose Bedrock content item to the document block shape used in
+// messages and tool results.
+function isDocumentBlock(block: unknown): block is {
+  document: { name: string; format?: unknown; source?: unknown };
+} {
+  if (typeof block !== "object" || block === null || !("document" in block)) {
+    return false;
+  }
+
+  const document = (block as { document: unknown }).document;
+  return (
+    typeof document === "object" &&
+    document !== null &&
+    "name" in document &&
+    typeof (document as { name: unknown }).name === "string"
   );
 }
 
@@ -1387,7 +1518,7 @@ function buildBedrockCommandContext(
   const context = {
     commandInput: {
       modelId: request.modelId,
-      messages: encodeProviderMessageToolNames({
+      messages: prepareProviderMessages({
         messages: request.messages,
         mapping: toolNameMapping,
         isNova: shouldEncodeHyphens,
@@ -1599,6 +1730,25 @@ export const bedrockAdapterFactory: LLMProvider<
 
     // Use fetch-based client.converseStream() - returns events with __rawBytes already set
     return bedrockClient.converseStream(request.modelId, commandInput);
+  },
+
+  extractInternalCode(error: unknown): ArchestraInternalErrorCode | undefined {
+    // Bedrock returns ValidationException with per-model messages for
+    // context overflow: "Input is too long for requested model.",
+    // "prompt is too long: X tokens > Y maximum." (Claude on Bedrock),
+    // or "model_context_window_exceeded" on some Nova models. No structured
+    // code — read the SDK error's name + message.
+    if (!error || typeof error !== "object") return undefined;
+    const awsError = error as { name?: string; message?: string };
+    if (awsError.name !== BedrockErrorTypes.VALIDATION) return undefined;
+    const msg = awsError.message?.toLowerCase() ?? "";
+    if (
+      msg.includes("too long") ||
+      msg.includes("model_context_window_exceeded")
+    ) {
+      return ArchestraInternalErrorCode.ContextLengthExceeded;
+    }
+    return undefined;
   },
 
   extractErrorMessage(error: unknown): string {

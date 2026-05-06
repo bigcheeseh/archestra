@@ -49,7 +49,7 @@ import {
 import { useIsAuthenticated } from "@/lib/auth/auth.hook";
 import { useHasPermissions, usePermissionMap } from "@/lib/auth/auth.query";
 import config from "@/lib/config/config";
-import { useEnterpriseFeature } from "@/lib/config/config.query";
+
 import { useGithubStars } from "@/lib/github/github.query";
 import { useAppIconLogo } from "@/lib/hooks/use-app-name";
 import { cn } from "@/lib/utils";
@@ -153,10 +153,16 @@ const contentNavGroups: NavGroup[] = [
         customIsActive: (pathname: string) => pathname === "/llm/proxies",
         subItems: [
           {
-            title: "Providers",
-            url: "/llm/providers/api-keys",
+            title: "Model Providers",
+            url: "/llm/model-providers/api-keys",
             customIsActive: (pathname: string) =>
-              pathname.startsWith("/llm/providers"),
+              pathname.startsWith("/llm/model-providers"),
+          },
+          {
+            title: "Proxy Auth",
+            url: "/llm/proxy-auth/virtual-keys",
+            customIsActive: (pathname: string) =>
+              pathname.startsWith("/llm/proxy-auth"),
           },
           {
             title: "Costs & Limits",
@@ -191,6 +197,13 @@ const contentNavGroups: NavGroup[] = [
         icon: MessagesSquare,
         customIsActive: (pathname: string) =>
           pathname.startsWith("/llm/logs") || pathname.startsWith("/mcp/logs"),
+      },
+      {
+        title: "Connect",
+        url: "/connection",
+        icon: Cable,
+        customIsActive: (pathname: string) =>
+          pathname.startsWith("/connection"),
       },
     ],
   },
@@ -403,25 +416,25 @@ export function AppSidebar() {
   const formattedStarCount = starCount ?? "";
   const permissionMap = usePermissionMap(requiredPagePermissionsMap);
   const appIconLogo = useAppIconLogo();
-  const knowledgeBaseEnabled = useEnterpriseFeature("knowledgeBase");
-  // Connect page requires at least one of these (OR logic)
-  const { data: canReadAgent } = useHasPermissions({ agent: ["read"] });
+  // Connect page requires both MCP gateway and LLM proxy read permissions
   const { data: canReadLlmProxy } = useHasPermissions({
     llmProxy: ["read"],
   });
   const { data: canReadMcpGateway } = useHasPermissions({
     mcpGateway: ["read"],
   });
-  const showConnect = canReadAgent || canReadLlmProxy || canReadMcpGateway;
+  const showConnect = canReadMcpGateway && canReadLlmProxy;
 
-  // Filter nav groups based on enterprise features
+  // Filter nav groups based on connect permissions
   const filteredNavGroups = React.useMemo(() => {
-    if (knowledgeBaseEnabled) return contentNavGroups;
     return contentNavGroups.map((group) => ({
       ...group,
-      items: group.items.filter((item) => item.title !== "Knowledge"),
+      items: group.items.filter((item) => {
+        if (item.title === "Connect" && !showConnect) return false;
+        return true;
+      }),
     }));
-  }, [knowledgeBaseEnabled]);
+  }, [showConnect]);
 
   // Build additional links for UserButton popout menu
   const userMenuLinks = React.useMemo(() => {
@@ -432,14 +445,6 @@ export function AppSidebar() {
       separator?: boolean;
     }[] = [];
 
-    if (showConnect) {
-      links.push({
-        href: "/connection",
-        icon: <Cable className="h-4 w-4" />,
-        label: "Connect",
-      });
-    }
-
     links.push({
       href: "/settings/account",
       icon: <Settings className="h-4 w-4" />,
@@ -448,7 +453,7 @@ export function AppSidebar() {
     });
 
     return links;
-  }, [showConnect]);
+  }, []);
 
   return (
     <Sidebar collapsible="icon">

@@ -63,23 +63,6 @@ export function SamlConfigForm({ form, hideProviderId }: SamlConfigFormProps) {
           )}
         />
 
-        <FormField
-          control={form.control}
-          name="domain"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>Domain</FormLabel>
-              <FormControl>
-                <Input placeholder="company.com" {...field} />
-              </FormControl>
-              <FormDescription>
-                Email domain for automatic provider detection.
-              </FormDescription>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
-
         <Separator />
 
         <div>

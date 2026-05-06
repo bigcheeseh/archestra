@@ -1,37 +1,40 @@
+export { default as A2AContextModel } from "./a2a-context";
+export { default as A2AMessageModel } from "./a2a-message";
+export { default as A2ATaskModel } from "./a2a-task";
+export { default as A2ATaskApprovalRequestModel } from "./a2a-task-approval-request";
 export { default as AccountModel } from "./account";
 export { default as AgentModel } from "./agent";
 export { default as AgentConnectorAssignmentModel } from "./agent-connector-assignment";
 export { default as AgentKnowledgeBaseModel } from "./agent-knowledge-base";
 export { default as AgentLabelModel } from "./agent-label";
-export { default as AgentSuggestedPromptModel } from "./agent-suggested-prompt";
 export { default as AgentTeamModel } from "./agent-team";
 export { default as AgentToolModel } from "./agent-tool";
-export { default as ApiKeyModel } from "./api-key";
 export { default as BrowserTabStateModel } from "./browser-tab-state";
 export { default as ChatOpsChannelBindingModel } from "./chatops-channel-binding";
 export { default as ChatOpsConfigModel } from "./chatops-config";
 export { default as ChatOpsProcessedMessageModel } from "./chatops-processed-message";
+export { default as ChatOpsThreadAgentOverrideModel } from "./chatops-thread-agent-override";
 export { default as ConnectorRunModel } from "./connector-run";
 export { default as ConversationModel } from "./conversation";
+export { default as ConversationChatErrorModel } from "./conversation-chat-error";
 export { default as ConversationEnabledToolModel } from "./conversation-enabled-tool";
 export { default as ConversationShareModel } from "./conversation-share";
-export { default as IncomingEmailSubscriptionModel } from "./incoming-email-subscription";
 export { default as InteractionModel } from "./interaction";
 export { default as InternalMcpCatalogModel } from "./internal-mcp-catalog";
 export { default as InvitationModel } from "./invitation";
 export { default as KbChunkModel } from "./kb-chunk";
 export { default as KbDocumentModel } from "./kb-document";
+export { default as KbUploadedFileModel } from "./kb-uploaded-file";
 export { default as KnowledgeBaseModel } from "./knowledge-base";
 export { default as KnowledgeBaseConnectorModel } from "./knowledge-base-connector";
 export { default as LimitModel, LimitValidationService } from "./limit";
+export { default as LlmOauthClientModel } from "./llm-oauth-client";
 export { default as LlmProviderApiKeyModel } from "./llm-provider-api-key";
 export { default as LlmProviderApiKeyModelLinkModel } from "./llm-provider-api-key-model";
 export { default as McpCatalogLabelModel } from "./mcp-catalog-label";
-export { default as McpCatalogTeamModel } from "./mcp-catalog-team";
 export { default as McpHttpSessionModel } from "./mcp-http-session";
 export { default as McpServerModel } from "./mcp-server";
 export { default as McpServerInstallationRequestModel } from "./mcp-server-installation-request";
-export { default as McpServerUserModel } from "./mcp-server-user";
 export { default as McpToolCallModel } from "./mcp-tool-call";
 export { default as MemberModel } from "./member";
 export { default as MessageModel } from "./message";
@@ -41,18 +44,16 @@ export { default as OAuthClientModel } from "./oauth-client";
 export { default as OptimizationRuleModel } from "./optimization-rule";
 export { default as OrganizationModel } from "./organization";
 export { default as OrganizationRoleModel } from "./organization-role";
-export { default as ProcessedEmailModel } from "./processed-email";
 export { default as ScheduleTriggerModel } from "./schedule-trigger";
 export { default as ScheduleTriggerRunModel } from "./schedule-trigger-run";
+/** @public — re-exported for testability (consumed by src/test/fixtures.ts) */
 export { default as SecretModel } from "./secret";
+/** @public — re-exported for testability (consumed by src/test/fixtures.ts) */
 export { default as SessionModel } from "./session";
 export { default as StatisticsModel } from "./statistics";
 export { default as TaskModel } from "./task";
 export { default as TeamModel } from "./team";
-export {
-  default as TeamTokenModel,
-  isArchestraPrefixedToken,
-} from "./team-token";
+export { default as TeamTokenModel } from "./team-token";
 export { default as ToolModel } from "./tool";
 export { default as ToolInvocationPolicyModel } from "./tool-invocation-policy";
 export { default as TrustedDataPolicyModel } from "./trusted-data-policy";

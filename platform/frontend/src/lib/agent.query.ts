@@ -10,6 +10,7 @@ import { handleApiError } from "@/lib/utils";
 
 const {
   createAgent,
+  cloneAgent,
   deleteAgent,
   getAgents,
   getAllAgents,
@@ -45,6 +46,28 @@ export function useProfiles(
   });
 }
 
+export function useCloneAgent() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (id: string) => {
+      const { data: responseData, error } = await cloneAgent({
+        path: { id },
+      });
+      if (error) {
+        handleApiError(error);
+      }
+      return responseData;
+    },
+    onSuccess: (data) => {
+      if (!data) return;
+      queryClient.invalidateQueries({ queryKey: ["agents"] });
+      if (data.id) {
+        queryClient.setQueryData(["agents", data.id], data);
+      }
+    },
+  });
+}
+
 // Paginated hook for the agents page
 export function useProfilesPaginated(
   params?: archestraApiTypes.GetAgentsData["query"] & {
@@ -63,6 +86,7 @@ export function useProfilesPaginated(
     teamIds,
     authorIds,
     excludeAuthorIds,
+    excludeOtherPersonalAgents,
     labels,
   } = params || {};
 
@@ -79,6 +103,7 @@ export function useProfilesPaginated(
     teamIds === undefined &&
     authorIds === undefined &&
     excludeAuthorIds === undefined &&
+    excludeOtherPersonalAgents === undefined &&
     labels === undefined &&
     (limit === undefined || limit === DEFAULT_TABLE_LIMIT);
 
@@ -96,6 +121,7 @@ export function useProfilesPaginated(
         teamIds,
         authorIds,
         excludeAuthorIds,
+        excludeOtherPersonalAgents,
         labels,
       },
     ],
@@ -113,6 +139,7 @@ export function useProfilesPaginated(
             teamIds,
             authorIds,
             excludeAuthorIds,
+            excludeOtherPersonalAgents,
             labels,
           },
         })

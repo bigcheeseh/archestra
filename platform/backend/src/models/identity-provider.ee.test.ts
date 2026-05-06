@@ -53,6 +53,7 @@ const mockProvider = {
 };
 
 const originalEnableE2eTestEndpoints = config.test.enableE2eTestEndpoints;
+const originalProduction = config.production;
 
 // Helper to create test params with proper typing for resolveSsoRole tests
 // Note: userInfo is included for compatibility with better-auth's IdpGetRoleData type
@@ -228,6 +229,111 @@ describe("IdentityProviderModel", () => {
       ).toBe("urn:ietf:params:oauth:token-type:access_token");
     });
 
+    test("clears persisted allowed email domains for non-Google API submissions", async ({
+      makeOrganization,
+      makeUser,
+    }) => {
+      const org = await makeOrganization();
+      const user = await makeUser();
+
+      const registerSSOProvider = vi.fn(async ({ body }) => {
+        await db.insert(schema.identityProvidersTable).values({
+          id: crypto.randomUUID(),
+          providerId: body.providerId,
+          issuer: body.issuer,
+          domain: body.domain,
+          organizationId: org.id,
+          userId: user.id,
+          oidcConfig: JSON.stringify(
+            body.oidcConfig,
+          ) as unknown as typeof schema.identityProvidersTable.$inferInsert.oidcConfig,
+        });
+      });
+
+      const created = await IdentityProviderModel.create(
+        {
+          providerId: "Okta",
+          issuer: "https://integrator-8514409.okta.com",
+          domain: "example.com",
+          userId: user.id,
+          oidcConfig: {
+            issuer: "https://integrator-8514409.okta.com",
+            skipDiscovery: true,
+            pkce: true,
+            clientId: "okta-client-id",
+            clientSecret: "okta-client-secret",
+            discoveryEndpoint:
+              "https://integrator-8514409.okta.com/.well-known/openid-configuration",
+          },
+        },
+        org.id,
+        new Headers(),
+        {
+          api: {
+            registerSSOProvider,
+          },
+        } as unknown as Parameters<typeof IdentityProviderModel.create>[3],
+      );
+
+      expect(registerSSOProvider).toHaveBeenCalledWith(
+        expect.objectContaining({
+          body: expect.objectContaining({
+            domain: "sso-placeholder.example.com",
+          }),
+        }),
+      );
+      expect(created.domain).toBe("");
+    });
+
+    test("keeps persisted allowed email domains for Google API submissions", async ({
+      makeOrganization,
+      makeUser,
+    }) => {
+      const org = await makeOrganization();
+      const user = await makeUser();
+
+      const registerSSOProvider = vi.fn(async ({ body }) => {
+        await db.insert(schema.identityProvidersTable).values({
+          id: crypto.randomUUID(),
+          providerId: body.providerId,
+          issuer: body.issuer,
+          domain: body.domain,
+          organizationId: org.id,
+          userId: user.id,
+          oidcConfig: JSON.stringify(
+            body.oidcConfig,
+          ) as unknown as typeof schema.identityProvidersTable.$inferInsert.oidcConfig,
+        });
+      });
+
+      const created = await IdentityProviderModel.create(
+        {
+          providerId: "Google",
+          issuer: "https://accounts.google.com",
+          domain: "example.com",
+          userId: user.id,
+          oidcConfig: {
+            issuer: "https://accounts.google.com",
+            skipDiscovery: true,
+            pkce: true,
+            clientId: "google-client-id",
+            clientSecret: "google-client-secret",
+            discoveryEndpoint:
+              "https://accounts.google.com/.well-known/openid-configuration",
+          },
+        },
+        org.id,
+        new Headers(),
+        {
+          api: {
+            registerSSOProvider,
+          },
+        } as unknown as Parameters<typeof IdentityProviderModel.create>[3],
+      );
+
+      expect(created.domain).toBe("example.com");
+    });
+
     test("rejects registration when discovery fetch returns a non-2xx response", async ({
       makeOrganization,
       makeUser,
@@ -336,6 +442,12 @@ describe("IdentityProviderModel", () => {
       makeOrganization,
       makeUser,
     }) => {
+      Object.defineProperty(config, "production", {
+        value: true,
+        writable: true,
+        configurable: true,
+      });
+
       const org = await makeOrganization();
       const user = await makeUser();
       const registerSSOProvider = vi.fn();
@@ -374,6 +486,11 @@ describe("IdentityProviderModel", () => {
         expect(registerSSOProvider).not.toHaveBeenCalled();
       } finally {
         globalThis.fetch = originalFetch;
+        Object.defineProperty(config, "production", {
+          value: originalProduction,
+          writable: true,
+          configurable: true,
+        });
       }
     });
 
@@ -453,6 +570,176 @@ describe("IdentityProviderModel", () => {
         globalThis.fetch = originalFetch;
         Object.defineProperty(config.test, "enableE2eTestEndpoints", {
           value: originalEnableE2eTestEndpoints,
+          writable: true,
+          configurable: true,
+        });
+      }
+    });
+
+    test("allows insecure discovery endpoints outside production", async ({
+      makeOrganization,
+      makeUser,
+    }) => {
+      Object.defineProperty(config, "production", {
+        value: false,
+        writable: true,
+        configurable: true,
+      });
+
+      const org = await makeOrganization();
+      const user = await makeUser();
+      const registerSSOProvider = vi.fn(async ({ body }) => {
+        await db.insert(schema.identityProvidersTable).values({
+          id: crypto.randomUUID(),
+          providerId: body.providerId,
+          issuer: body.issuer,
+          domain: body.domain,
+          organizationId: org.id,
+          userId: user.id,
+          domainVerified: true,
+          oidcConfig: JSON.stringify(
+            body.oidcConfig,
+          ) as unknown as typeof schema.identityProvidersTable.$inferInsert.oidcConfig,
+        });
+      });
+      const fetchSpy = vi.fn(async () => {
+        return new Response(
+          JSON.stringify({
+            issuer: "http://keycloak:8080/realms/archestra",
+            authorization_endpoint:
+              "http://keycloak:8080/realms/archestra/protocol/openid-connect/auth",
+            token_endpoint:
+              "http://keycloak:8080/realms/archestra/protocol/openid-connect/token",
+            jwks_uri:
+              "http://keycloak:8080/realms/archestra/protocol/openid-connect/certs",
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        );
+      });
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = fetchSpy as typeof fetch;
+
+      try {
+        await expect(
+          IdentityProviderModel.create(
+            {
+              providerId: "example-idp-http-local-dev",
+              issuer: "http://keycloak:8080/realms/archestra",
+              domain: "example.com",
+              userId: user.id,
+              oidcConfig: {
+                issuer: "http://keycloak:8080/realms/archestra",
+                pkce: true,
+                clientId: "load-spark-platform",
+                clientSecret: "secret",
+                discoveryEndpoint:
+                  "http://keycloak:8080/realms/archestra/.well-known/openid-configuration",
+              },
+            },
+            org.id,
+            new Headers(),
+            {
+              api: {
+                registerSSOProvider,
+              },
+            } as unknown as Parameters<typeof IdentityProviderModel.create>[3],
+          ),
+        ).resolves.toBeDefined();
+
+        expect(fetchSpy).toHaveBeenCalledOnce();
+        expect(registerSSOProvider).toHaveBeenCalledOnce();
+      } finally {
+        globalThis.fetch = originalFetch;
+        Object.defineProperty(config, "production", {
+          value: originalProduction,
+          writable: true,
+          configurable: true,
+        });
+      }
+    });
+
+    test("accepts discovery issuer when configured issuer is blank", async ({
+      makeOrganization,
+      makeUser,
+    }) => {
+      Object.defineProperty(config, "production", {
+        value: false,
+        writable: true,
+        configurable: true,
+      });
+
+      const org = await makeOrganization();
+      const user = await makeUser();
+      const registerSSOProvider = vi.fn(async ({ body }) => {
+        await db.insert(schema.identityProvidersTable).values({
+          id: crypto.randomUUID(),
+          providerId: body.providerId,
+          issuer: body.issuer,
+          domain: body.domain,
+          organizationId: org.id,
+          userId: user.id,
+          domainVerified: true,
+          oidcConfig: JSON.stringify(
+            body.oidcConfig,
+          ) as unknown as typeof schema.identityProvidersTable.$inferInsert.oidcConfig,
+        });
+      });
+      const fetchSpy = vi.fn(async () => {
+        return new Response(
+          JSON.stringify({
+            issuer: "http://localhost:30081/realms/archestra",
+            authorization_endpoint:
+              "http://localhost:30081/realms/archestra/protocol/openid-connect/auth",
+            token_endpoint:
+              "http://localhost:30081/realms/archestra/protocol/openid-connect/token",
+            jwks_uri:
+              "http://localhost:30081/realms/archestra/protocol/openid-connect/certs",
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        );
+      });
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = fetchSpy as typeof fetch;
+
+      try {
+        await expect(
+          IdentityProviderModel.create(
+            {
+              providerId: "example-idp-empty-issuer",
+              issuer: "",
+              domain: "example.com",
+              userId: user.id,
+              oidcConfig: {
+                issuer: "",
+                pkce: true,
+                clientId: "load-spark-platform",
+                clientSecret: "secret",
+                discoveryEndpoint:
+                  "http://localhost:30081/realms/archestra/.well-known/openid-configuration",
+              },
+            },
+            org.id,
+            new Headers(),
+            {
+              api: {
+                registerSSOProvider,
+              },
+            } as unknown as Parameters<typeof IdentityProviderModel.create>[3],
+          ),
+        ).resolves.toBeDefined();
+
+        expect(fetchSpy).toHaveBeenCalledOnce();
+        expect(registerSSOProvider).toHaveBeenCalledOnce();
+      } finally {
+        globalThis.fetch = originalFetch;
+        Object.defineProperty(config, "production", {
+          value: originalProduction,
           writable: true,
           configurable: true,
         });
@@ -841,8 +1128,29 @@ describe("IdentityProviderModel", () => {
 
       expect(updated).not.toBeNull();
       expect(updated?.issuer).toBe("https://new-issuer.com");
-      expect(updated?.domain).toBe("new.example.com");
+      expect(updated?.domain).toBe("");
       expect(updated?.providerId).toBe("Okta"); // Unchanged
+    });
+
+    test("keeps updated allowed email domains for Google providers", async ({
+      makeOrganization,
+      makeIdentityProvider,
+    }) => {
+      const org = await makeOrganization();
+
+      const inserted = await makeIdentityProvider(org.id, {
+        providerId: "Google",
+        issuer: "https://accounts.google.com",
+        domain: "old.example.com",
+      });
+
+      const updated = await IdentityProviderModel.update(
+        inserted.id,
+        { domain: "new.example.com" },
+        org.id,
+      );
+
+      expect(updated?.domain).toBe("new.example.com");
     });
 
     test("can update oidcConfig", async ({

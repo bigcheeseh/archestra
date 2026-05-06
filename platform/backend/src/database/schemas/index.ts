@@ -1,3 +1,7 @@
+export { default as a2aContextsTable } from "./a2a-context";
+export { default as a2aMessagesTable } from "./a2a-message";
+export { default as a2aTasksTable } from "./a2a-task";
+export { default as a2aTaskApprovalRequestsTable } from "./a2a-task-approval-request";
 export { default as accountsTable } from "./account";
 export { default as agentsTable } from "./agent";
 export { default as agentConnectorAssignmentsTable } from "./agent-connector-assignment";
@@ -10,8 +14,10 @@ export { default as apikeysTable } from "./api-key";
 export { default as browserTabStatesTable } from "./browser-tab-state";
 export { default as chatopsChannelBindingsTable } from "./chatops-channel-binding";
 export { default as chatopsProcessedMessagesTable } from "./chatops-processed-message";
+export { default as chatopsThreadAgentOverrideTable } from "./chatops-thread-agent-override";
 export { default as connectorRunsTable } from "./connector-run";
 export { default as conversationsTable } from "./conversation";
+export { default as conversationChatErrorsTable } from "./conversation-chat-error";
 export { default as conversationEnabledToolsTable } from "./conversation-enabled-tool";
 export {
   conversationShareTeamsTable,
@@ -26,6 +32,7 @@ export { default as invitationsTable } from "./invitation";
 export { default as jwksTable } from "./jwks";
 export { default as kbChunksTable } from "./kb-chunk";
 export { default as kbDocumentsTable } from "./kb-document";
+export { default as kbUploadedFilesTable } from "./kb-uploaded-file";
 export { default as knowledgeBasesTable } from "./knowledge-base";
 export {
   default as knowledgeBaseConnectorsTable,
@@ -72,4 +79,5 @@ export { default as usersTable } from "./user";
 export { default as userTokensTable } from "./user-token";
 export { default as verificationsTable } from "./verification";
 export { default as virtualApiKeysTable } from "./virtual-api-key";
+export { default as virtualApiKeyProviderApiKeysTable } from "./virtual-api-key-provider-api-key";
 export { default as virtualApiKeyTeamsTable } from "./virtual-api-key-team";

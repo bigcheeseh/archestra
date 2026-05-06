@@ -1304,11 +1304,12 @@ class McpClient {
     // Get all servers for this catalog
     const allServers = await McpServerModel.findByCatalogId(tool.catalogId);
 
-    // User token: try user's personal server, then team-owned servers for teams the user belongs to
+    // User token: try user's personal server, then team-owned servers for
+    // teams the user belongs to, then fall back to an org-scoped install.
     if (tokenAuth.userId) {
       // Priority 1: Personal credential owned by current user
       const userServer = allServers.find(
-        (s) => s.ownerId === tokenAuth.userId && !s.teamId,
+        (s) => s.ownerId === tokenAuth.userId && !s.teamId && s.scope !== "org",
       );
       if (userServer) {
         logger.info(
@@ -1348,9 +1349,28 @@ class McpClient {
           mcpServerName: teamServer.name,
         };
       }
+
+      // Priority 3: Org-scoped install
+      const orgServer = allServers.find((s) => s.scope === "org");
+      if (orgServer) {
+        logger.info(
+          {
+            toolName: toolCall.name,
+            catalogId: tool.catalogId,
+            serverId: orgServer.id,
+            userId: tokenAuth.userId,
+          },
+          `Dynamic resolution: using org-scoped server for user ${tokenAuth.userId}`,
+        );
+        return {
+          targetMcpServerId: orgServer.id,
+          mcpServerName: orgServer.name,
+        };
+      }
     }
 
-    // Team token: only try team-owned servers for the token's team
+    // Team token: try team-owned servers for the token's team, then fall back
+    // to an org-scoped install.
     if (tokenAuth.teamId) {
       const teamServer = allServers.find((s) => s.teamId === tokenAuth.teamId);
       if (teamServer) {
@@ -1366,6 +1386,23 @@ class McpClient {
         return {
           targetMcpServerId: teamServer.id,
           mcpServerName: teamServer.name,
+        };
+      }
+
+      const orgServer = allServers.find((s) => s.scope === "org");
+      if (orgServer) {
+        logger.info(
+          {
+            toolName: toolCall.name,
+            catalogId: tool.catalogId,
+            serverId: orgServer.id,
+            teamId: tokenAuth.teamId,
+          },
+          `Dynamic resolution: using org-scoped server for team ${tokenAuth.teamId}`,
+        );
+        return {
+          targetMcpServerId: orgServer.id,
+          mcpServerName: orgServer.name,
         };
       }
     }
@@ -2303,9 +2340,9 @@ class McpClient {
   }): Promise<CommonMcpToolDefinition[]> {
     const { catalogItem, mcpServerId, secrets, secretId } = params;
 
-    // For local servers, retry connection a few times since the MCP server process
-    // may need time to initialize even after the pod is ready
-    const maxRetries = catalogItem.serverType === "local" ? 3 : 1;
+    // Local stdio servers can report a ready pod before the MCP process accepts
+    // JSON-RPC, especially while the runtime is still pulling or starting Node.
+    const maxRetries = catalogItem.serverType === "local" ? 6 : 1;
     const retryDelayMs = 5000; // 5 seconds between retries
 
     let lastError: Error | undefined;
@@ -3134,6 +3171,7 @@ function buildStaticCredentialHeaders(params: {
       fieldName,
       headerName: config.headerName,
       secretValue,
+      valuePrefix: config.valuePrefix,
     });
   }
 
@@ -3269,7 +3307,12 @@ function getStaticCredentialHeaderValue(params: {
   fieldName: string;
   headerName: string;
   secretValue: string;
+  valuePrefix?: string;
 }): string {
+  if (params.valuePrefix) {
+    return `${params.valuePrefix}${params.secretValue}`;
+  }
+
   if (
     params.fieldName === "access_token" &&
     params.headerName.toLowerCase() === "authorization"

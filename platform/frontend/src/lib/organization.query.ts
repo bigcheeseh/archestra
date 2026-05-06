@@ -337,6 +337,7 @@ export function useUpdateAppearanceSettings(
         ogDescription: updatedOrganization.ogDescription,
         footerText: updatedOrganization.footerText,
         chatLinks: updatedOrganization.chatLinks,
+        onboardingWizard: updatedOrganization.onboardingWizard,
         chatErrorSupportMessage: updatedOrganization.chatErrorSupportMessage,
         slimChatErrorUi: updatedOrganization.slimChatErrorUi,
         animateChatPlaceholders: updatedOrganization.animateChatPlaceholders,
@@ -438,19 +439,49 @@ export function useUpdateAgentSettings(
 }
 
 /**
- * Update MCP settings (OAuth access token lifetime)
+ * Update /connection admin settings (default gateway/proxy, hidden client/provider lists)
  */
-export function useUpdateMcpSettings(
+export function useUpdateConnectionSettings(
   onSuccessMessage: string,
   onErrorMessage: string,
 ) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async (
-      data: archestraApiTypes.UpdateMcpSettingsData["body"],
+      data: archestraApiTypes.UpdateConnectionSettingsData["body"],
     ) => {
       const { data: updatedOrganization, error } =
-        await archestraApiSdk.updateMcpSettings({ body: data });
+        await archestraApiSdk.updateConnectionSettings({ body: data });
+
+      if (error) {
+        toast.error(onErrorMessage);
+        return null;
+      }
+
+      return updatedOrganization;
+    },
+    onSuccess: (updatedOrganization) => {
+      if (!updatedOrganization) return;
+      queryClient.setQueryData(organizationKeys.details(), updatedOrganization);
+      toast.success(onSuccessMessage);
+    },
+  });
+}
+
+/**
+ * Update Auth settings (OAuth access token lifetime)
+ */
+export function useUpdateAuthSettings(
+  onSuccessMessage: string,
+  onErrorMessage: string,
+) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (
+      data: archestraApiTypes.UpdateAuthSettingsData["body"],
+    ) => {
+      const { data: updatedOrganization, error } =
+        await archestraApiSdk.updateAuthSettings({ body: data });
 
       if (error) {
         toast.error(onErrorMessage);

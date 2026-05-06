@@ -38,6 +38,7 @@ import {
   setOAuthMcpServerId,
   setOAuthPendingAfterEnvVars,
   setOAuthReturnUrl,
+  setOAuthScope,
   setOAuthServerType,
   setOAuthState,
   setOAuthTeamId,
@@ -58,6 +59,7 @@ import {
   useReauthenticateMcpServer,
   useReinstallMcpServer,
 } from "@/lib/mcp/mcp-server.query";
+import { buildRemoteInstallCredentialPayload } from "@/lib/mcp/remote-install-payload";
 import websocketService from "@/lib/websocket/websocket";
 import { CreateCatalogDialog } from "./create-catalog-dialog";
 import { CustomServerRequestDialog } from "./custom-server-request-dialog";
@@ -83,6 +85,7 @@ import {
   RemoteServerInstallDialog,
   type RemoteServerInstallResult,
 } from "./remote-server-install-dialog";
+import type { McpServerInstallScope } from "./select-mcp-server-credential-type-and-teams";
 
 export function InternalMCPCatalog({
   initialData,
@@ -143,6 +146,8 @@ export function InternalMCPCatalog({
   );
   // When true, install dialog hides the team selector (personal connection only)
   const [installPersonalOnly, setInstallPersonalOnly] = useState(false);
+  // When true, install dialog forces the organization-wide scope
+  const [installOrgOnly, setInstallOrgOnly] = useState(false);
 
   // Update URL when search query changes (debounced via DebouncedInput)
   const handleSearchChange = useCallback(
@@ -173,6 +178,10 @@ export function InternalMCPCatalog({
   const [reinstallServerTeamId, setReinstallServerTeamId] = useState<
     string | null
   >(null);
+  // Track the scope of the server being reinstalled (to pre-select scope)
+  const [reinstallServerScope, setReinstallServerScope] = useState<
+    McpServerInstallScope | undefined
+  >(undefined);
   // Track server ID for re-authentication (preserves tool assignments)
   const [reauthServerId, setReauthServerId] = useState<string | null>(null);
   const [detailsServerName, setDetailsServerName] = useState<string | null>(
@@ -400,6 +409,7 @@ export function InternalMCPCatalog({
     if (!options?.preserveInstallTarget) {
       setPreselectedTeamId(null);
       setInstallPersonalOnly(false);
+      setInstallOrgOnly(false);
     }
 
     const hasUserConfig =
@@ -425,6 +435,7 @@ export function InternalMCPCatalog({
     if (!options?.preserveInstallTarget) {
       setPreselectedTeamId(null);
       setInstallPersonalOnly(false);
+      setInstallOrgOnly(false);
     }
 
     // Check if this local server requires OAuth authentication
@@ -502,16 +513,19 @@ export function InternalMCPCatalog({
     return promptedEnvVars.length === 0 && promptableUserConfig.length === 0;
   };
 
-  // Install directly without opening a dialog (works for both personal and shared)
+  // Install directly without opening a dialog (works for personal, team, and org)
   const handleDirectInstall = async (
     catalogItem: CatalogItem,
-    teamId?: string,
+    target?: { teamId?: string; scope?: McpServerInstallScope },
   ) => {
     setInstallingItemId(catalogItem.id);
+    const scope: McpServerInstallScope =
+      target?.scope ?? (target?.teamId ? "team" : "personal");
     const result = await installMutation.mutateAsync({
       name: catalogItem.name,
       catalogId: catalogItem.id,
-      ...(teamId && { teamId }),
+      scope,
+      ...(scope === "team" && target?.teamId ? { teamId: target.teamId } : {}),
       dontShowToast: true,
     });
 
@@ -554,9 +568,28 @@ export function InternalMCPCatalog({
     teamId: string,
   ) => {
     if (canDirectInstall(catalogItem)) {
-      handleDirectInstall(catalogItem, teamId);
+      handleDirectInstall(catalogItem, { teamId, scope: "team" });
     } else {
       setPreselectedTeamId(teamId);
+      if (catalogItem.serverType === "local") {
+        handleInstallLocalServer(catalogItem, {
+          preserveInstallTarget: true,
+        });
+      } else {
+        handleInstallRemoteServer(catalogItem, false, {
+          preserveInstallTarget: true,
+        });
+      }
+    }
+  };
+
+  // Add organization connection: skip dialog if no config needed, otherwise
+  // open dialog with scope locked to org.
+  const handleAddOrgConnection = (catalogItem: CatalogItem) => {
+    if (canDirectInstall(catalogItem)) {
+      handleDirectInstall(catalogItem, { scope: "org" });
+    } else {
+      setInstallOrgOnly(true);
       if (catalogItem.serverType === "local") {
         handleInstallLocalServer(catalogItem, {
           preserveInstallTarget: true,
@@ -578,7 +611,9 @@ export function InternalMCPCatalog({
     await installMutation.mutateAsync({
       name: catalogItem.name,
       catalogId: catalogItem.id,
-      teamId: result.teamId ?? undefined,
+      scope: result.scope,
+      teamId:
+        result.scope === "team" ? (result.teamId ?? undefined) : undefined,
     });
     closeDialog("no-auth");
     setNoAuthCatalogItem(null);
@@ -662,6 +697,7 @@ export function InternalMCPCatalog({
       setLocalServerCatalogItem(null);
       setReinstallServerId(null);
       setReinstallServerTeamId(null);
+      setReinstallServerScope(undefined);
 
       const serverIdToReinstall = reinstallServerId;
       try {
@@ -698,7 +734,11 @@ export function InternalMCPCatalog({
       environmentValues: installResult.environmentValues,
       userConfigValues: installResult.userConfigValues,
       isByosVault: installResult.isByosVault,
-      teamId: installResult.teamId ?? undefined,
+      scope: installResult.scope,
+      teamId:
+        installResult.scope === "team"
+          ? (installResult.teamId ?? undefined)
+          : undefined,
       serviceAccount: installResult.serviceAccount,
       dontShowToast: true,
     });
@@ -724,30 +764,14 @@ export function InternalMCPCatalog({
     catalogItem: CatalogItem,
     result: RemoteServerInstallResult,
   ) => {
-    // For non-BYOS mode: Extract access_token from metadata if present and pass as accessToken
-    // For BYOS mode: metadata contains vault references, pass via userConfigValues
-    const accessToken =
-      !result.isByosVault &&
-      result.metadata?.access_token &&
-      typeof result.metadata.access_token === "string"
-        ? result.metadata.access_token
-        : undefined;
+    const credentialPayload = buildRemoteInstallCredentialPayload(result);
 
     // Re-authentication mode: update existing server credentials in-place
     if (reauthServerId) {
       await reauthMutation.mutateAsync({
         id: reauthServerId,
         name: catalogItem.name,
-        ...(accessToken && { accessToken }),
-        ...(result.isByosVault && {
-          userConfigValues: result.metadata as Record<string, string>,
-        }),
-        ...(!result.isByosVault &&
-          !accessToken &&
-          result.metadata && {
-            userConfigValues: result.metadata as Record<string, string>,
-          }),
-        isByosVault: result.isByosVault,
+        ...credentialPayload,
       });
 
       closeDialog("remote-install");
@@ -761,12 +785,10 @@ export function InternalMCPCatalog({
     await installMutation.mutateAsync({
       name: catalogItem.name,
       catalogId: catalogItem.id,
-      ...(accessToken && { accessToken }),
-      ...(result.isByosVault && {
-        userConfigValues: result.metadata as Record<string, string>,
-      }),
-      isByosVault: result.isByosVault,
-      teamId: result.teamId ?? undefined,
+      ...credentialPayload,
+      scope: result.scope,
+      teamId:
+        result.scope === "team" ? (result.teamId ?? undefined) : undefined,
     });
     setInstallingItemId(null);
   };
@@ -784,7 +806,8 @@ export function InternalMCPCatalog({
       // Store state in session storage for the callback
       setOAuthState(state);
       setOAuthCatalogId(selectedCatalogItem.id);
-      setOAuthTeamId(result.teamId ?? null);
+      setOAuthTeamId(result.scope === "team" ? (result.teamId ?? null) : null);
+      setOAuthScope(result.scope);
 
       // If re-authenticating via OAuth, store reauth context
       if (reauthServerId) {
@@ -902,6 +925,10 @@ export function InternalMCPCatalog({
         setLocalServerCatalogItem(catalogItem);
         setReinstallServerId(installedServer.id);
         setReinstallServerTeamId(installedServer.teamId ?? null);
+        setReinstallServerScope(
+          (installedServer as unknown as { scope?: McpServerInstallScope })
+            .scope,
+        );
         openDialog("local-install");
       } else {
         // No prompted env vars - still confirm before reinstalling
@@ -1036,10 +1063,10 @@ export function InternalMCPCatalog({
     ),
   ).filter((item) => item.id !== ARCHESTRA_MCP_CATALOG_ID);
 
-  const draftItems = allFilteredItems.filter(
+  const personalItems = allFilteredItems.filter(
     (item) => item.scope === "personal",
   );
-  const publishedItems = allFilteredItems.filter(
+  const sharedItems = allFilteredItems.filter(
     (item) => item.scope !== "personal",
   );
 
@@ -1118,13 +1145,13 @@ export function InternalMCPCatalog({
         <LabelFilterBadges onRemoveLabel={handleRemoveLabel} />
       )}
       <div className="space-y-6">
-        {draftItems.length > 0 && (
+        {personalItems.length > 0 && (
           <div className="space-y-3">
             <h3 className="text-sm font-medium text-muted-foreground uppercase tracking-wide">
-              Unpublished
+              Personal
             </h3>
             <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-              {draftItems.map((item) => {
+              {personalItems.map((item) => {
                 const serverInfo = getInstalledServerInfo(item);
                 return (
                   <McpServerCard
@@ -1165,6 +1192,7 @@ export function InternalMCPCatalog({
                     onAddSharedConnection={(teamId) =>
                       handleAddSharedConnection(item, teamId)
                     }
+                    onAddOrgConnection={() => handleAddOrgConnection(item)}
                     isBuiltInPlaywright={isPlaywrightCatalogItem(item.id)}
                   />
                 );
@@ -1173,15 +1201,15 @@ export function InternalMCPCatalog({
           </div>
         )}
 
-        {publishedItems.length > 0 ? (
+        {sharedItems.length > 0 ? (
           <div className="space-y-3">
-            {draftItems.length > 0 && (
+            {personalItems.length > 0 && (
               <h3 className="text-sm font-medium text-muted-foreground uppercase tracking-wide">
-                Published
+                Shared
               </h3>
             )}
             <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-              {publishedItems.map((item) => {
+              {sharedItems.map((item) => {
                 const serverInfo = getInstalledServerInfo(item);
                 return (
                   <McpServerCard
@@ -1222,6 +1250,7 @@ export function InternalMCPCatalog({
                     onAddSharedConnection={(teamId) =>
                       handleAddSharedConnection(item, teamId)
                     }
+                    onAddOrgConnection={() => handleAddOrgConnection(item)}
                     isBuiltInPlaywright={isPlaywrightCatalogItem(item.id)}
                   />
                 );
@@ -1229,7 +1258,7 @@ export function InternalMCPCatalog({
             </div>
           </div>
         ) : (
-          draftItems.length === 0 && (
+          personalItems.length === 0 && (
             <div className="flex flex-col items-center justify-center py-12 text-center">
               {hasActiveFilters ? (
                 <>
@@ -1322,6 +1351,7 @@ export function InternalMCPCatalog({
           setReauthServerId(null);
           setPreselectedTeamId(null);
           setInstallPersonalOnly(false);
+          setInstallOrgOnly(false);
         }}
         onConfirm={handleRemoteServerInstallConfirm}
         catalogItem={selectedCatalogItem}
@@ -1329,6 +1359,7 @@ export function InternalMCPCatalog({
         isReauth={!!reauthServerId}
         preselectedTeamId={preselectedTeamId}
         personalOnly={installPersonalOnly}
+        orgOnly={installOrgOnly}
       />
 
       <OAuthConfirmationDialog
@@ -1346,10 +1377,12 @@ export function InternalMCPCatalog({
           setReauthServerId(null);
           setPreselectedTeamId(null);
           setInstallPersonalOnly(false);
+          setInstallOrgOnly(false);
         }}
         catalogId={selectedCatalogItem?.id}
         preselectedTeamId={preselectedTeamId}
         personalOnly={installPersonalOnly}
+        orgOnly={installOrgOnly}
       />
 
       <ReinstallConfirmationDialog
@@ -1358,7 +1391,6 @@ export function InternalMCPCatalog({
           closeDialog("reinstall");
           setCatalogItemForReinstall(null);
         }}
-        isRemoteServer={catalogItemForReinstall?.serverType === "remote"}
         onConfirm={handleReinstallConfirm}
         serverName={catalogItemForReinstall?.name || ""}
         isReinstalling={reinstallMutation.isPending}
@@ -1371,12 +1403,14 @@ export function InternalMCPCatalog({
           setNoAuthCatalogItem(null);
           setPreselectedTeamId(null);
           setInstallPersonalOnly(false);
+          setInstallOrgOnly(false);
         }}
         onInstall={handleNoAuthConfirm}
         catalogItem={noAuthCatalogItem}
         isInstalling={installMutation.isPending}
         preselectedTeamId={preselectedTeamId}
         personalOnly={installPersonalOnly}
+        orgOnly={installOrgOnly}
       />
 
       {localServerCatalogItem && (
@@ -1387,9 +1421,11 @@ export function InternalMCPCatalog({
             setLocalServerCatalogItem(null);
             setReinstallServerId(null);
             setReinstallServerTeamId(null);
+            setReinstallServerScope(undefined);
             setReauthServerId(null);
             setPreselectedTeamId(null);
             setInstallPersonalOnly(false);
+            setInstallOrgOnly(false);
           }}
           onConfirm={handleLocalServerInstallConfirm}
           catalogItem={localServerCatalogItem}
@@ -1400,9 +1436,11 @@ export function InternalMCPCatalog({
           }
           isReinstall={!!reinstallServerId}
           existingTeamId={reinstallServerTeamId}
+          existingScope={reinstallServerScope}
           isReauth={!!reauthServerId}
           preselectedTeamId={preselectedTeamId}
           personalOnly={installPersonalOnly}
+          orgOnly={installOrgOnly}
         />
       )}
 
@@ -1424,6 +1462,13 @@ export function InternalMCPCatalog({
             );
             if (!catalogItem) return;
             handleAddSharedConnection(catalogItem, teamId);
+          }}
+          onAddOrgConnection={() => {
+            const catalogItem = catalogItems?.find(
+              (item) => item.id === manageCatalogId,
+            );
+            if (!catalogItem) return;
+            handleAddOrgConnection(catalogItem);
           }}
         />
       )}

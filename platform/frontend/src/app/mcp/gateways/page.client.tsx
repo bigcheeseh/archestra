@@ -1,22 +1,10 @@
 "use client";
 
-import {
-  type AgentType,
-  archestraApiSdk,
-  type archestraApiTypes,
-  E2eTestId,
-} from "@shared";
+import { archestraApiSdk, type archestraApiTypes, E2eTestId } from "@shared";
 import { useQuery } from "@tanstack/react-query";
 import type { ColumnDef, SortingState } from "@tanstack/react-table";
-import {
-  ChevronDown,
-  ChevronUp,
-  DollarSign,
-  Eye,
-  Plus,
-  Route,
-  Server,
-} from "lucide-react";
+import { ChevronDown, ChevronUp, Plus } from "lucide-react";
+import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
 import { ErrorBoundary } from "@/app/_parts/error-boundary";
@@ -27,24 +15,17 @@ import {
   ActiveFilterBadges,
   AgentScopeFilter,
 } from "@/components/agent-scope-filter";
-import {
-  ConnectDialog,
-  ConnectDialogSection,
-} from "@/components/connect-dialog";
 import { DeleteConfirmDialog } from "@/components/delete-confirm-dialog";
 import { ExternalDocsLink } from "@/components/external-docs-link";
 import { LoadingSpinner, LoadingWrapper } from "@/components/loading";
-import { McpConnectionInstructions } from "@/components/mcp-connection-instructions";
 import { PageLayout } from "@/components/page-layout";
 import { PermissionRequirementHint } from "@/components/permission-requirement-hint";
-import { ProxyConnectionInstructions } from "@/components/proxy-connection-instructions";
 import { ResourceVisibilityBadge } from "@/components/resource-visibility-badge";
 import { SearchInput } from "@/components/search-input";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { DataTable } from "@/components/ui/data-table";
 import { PermissionButton } from "@/components/ui/permission-button";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Tooltip,
   TooltipContent,
@@ -52,7 +33,11 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { DEFAULT_SORT_BY, DEFAULT_SORT_DIRECTION } from "@/consts";
-import { useDeleteProfile, useProfilesPaginated } from "@/lib/agent.query";
+import {
+  useDeleteProfile,
+  useProfile,
+  useProfilesPaginated,
+} from "@/lib/agent.query";
 import { useHasPermissions } from "@/lib/auth/auth.query";
 import { authClient } from "@/lib/clients/auth/auth-client";
 import { getFrontendDocsUrl } from "@/lib/docs/docs";
@@ -160,6 +145,12 @@ function McpGateways({
     excludeAuthorIds: excludeAuthorIdsFromUrl
       ? excludeAuthorIdsFromUrl.split(",")
       : undefined,
+    excludeOtherPersonalAgents:
+      scopeFromUrl !== "personal" &&
+      !authorIdsFromUrl &&
+      !excludeAuthorIdsFromUrl
+        ? true
+        : undefined,
     labels: labelsFromUrl || undefined,
   });
   const { data: canReadTeams } = useHasPermissions({ team: ["read"] });
@@ -195,17 +186,40 @@ function McpGateways({
   type GatewayData =
     archestraApiTypes.GetAgentsResponses["200"]["data"][number];
 
+  const router = useRouter();
+
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(
     searchParams.get("create") === "true",
   );
-  const [connectingGateway, setConnectingGateway] = useState<{
-    id: string;
-    name: string;
-    agentType: AgentType;
-  } | null>(null);
+  const editGatewayIdFromUrl = searchParams.get("edit");
+  const openToolsFromUrl = searchParams.get("openTools") === "true";
+  const { data: editGatewayFromUrl } = useProfile(
+    editGatewayIdFromUrl ?? undefined,
+  );
+  const navigateToConnection = useCallback(
+    (agentId: string) => {
+      router.push(
+        `/connection?gatewayId=${encodeURIComponent(agentId)}&from=table`,
+      );
+    },
+    [router],
+  );
   const [editingGateway, setEditingGateway] = useState<GatewayData | null>(
     null,
   );
+  const [autoOpenedEditGatewayId, setAutoOpenedEditGatewayId] = useState<
+    string | null
+  >(null);
+  useEffect(() => {
+    if (
+      editGatewayIdFromUrl &&
+      editGatewayFromUrl &&
+      editGatewayFromUrl.id !== autoOpenedEditGatewayId
+    ) {
+      setEditingGateway(editGatewayFromUrl as unknown as GatewayData);
+      setAutoOpenedEditGatewayId(editGatewayFromUrl.id);
+    }
+  }, [editGatewayIdFromUrl, editGatewayFromUrl, autoOpenedEditGatewayId]);
   const [deletingGatewayId, setDeletingGatewayId] = useState<string | null>(
     null,
   );
@@ -387,7 +401,7 @@ function McpGateways({
           <McpGatewayActions
             agent={agent}
             canModify={canModify}
-            onConnect={setConnectingGateway}
+            onConnect={(a) => navigateToConnection(a.id)}
             onEdit={(agentData) => {
               setEditingGateway(agentData);
             }}
@@ -429,7 +443,7 @@ function McpGateways({
             onClick={() => setIsCreateDialogOpen(true)}
             data-testid={E2eTestId.CreateAgentButton}
           >
-            <Plus className="mr-2 h-4 w-4" />
+            <Plus className="h-4 w-4" />
             Create MCP Gateway
           </PermissionButton>
         }
@@ -443,7 +457,7 @@ function McpGateways({
                   searchFields={["name"]}
                   paramName="name"
                 />
-                <AgentScopeFilter />
+                <AgentScopeFilter ownerLabelPlural="MCP gateways" />
               </div>
               {!canReadTeams && (
                 <PermissionRequirementHint
@@ -496,19 +510,10 @@ function McpGateways({
               onOpenChange={setIsCreateDialogOpen}
               agentType="mcp_gateway"
               defaultIconType="mcp_gateway"
-              onCreated={(gateway) => {
+              onCreated={() => {
                 setIsCreateDialogOpen(false);
-                setConnectingGateway({ ...gateway, agentType: "mcp_gateway" });
               }}
             />
-
-            {connectingGateway && (
-              <ConnectGatewayDialog
-                agent={connectingGateway}
-                open={!!connectingGateway}
-                onOpenChange={(open) => !open && setConnectingGateway(null)}
-              />
-            )}
 
             <AgentDialog
               open={!!editingGateway}
@@ -516,6 +521,10 @@ function McpGateways({
               agent={editingGateway}
               agentType={editingGateway?.agentType || "mcp_gateway"}
               defaultIconType="mcp_gateway"
+              openToolsCombobox={
+                openToolsFromUrl &&
+                editingGateway?.id === autoOpenedEditGatewayId
+              }
             />
 
             {deletingGatewayId && (
@@ -529,135 +538,6 @@ function McpGateways({
         </div>
       </PageLayout>
     </LoadingWrapper>
-  );
-}
-
-function GatewayConnectionColumns({
-  agentId,
-  agentType,
-}: {
-  agentId: string;
-  agentType: AgentType;
-}) {
-  const [activeTab, setActiveTab] = useState<"proxy" | "mcp">("mcp");
-
-  return (
-    <Tabs
-      value={activeTab}
-      onValueChange={(value) => setActiveTab(value as "proxy" | "mcp")}
-      className="space-y-6"
-    >
-      <ConnectDialogSection
-        title="Connection Mode"
-        description={
-          agentType === "profile"
-            ? "Choose whether to connect through the MCP Gateway or the LLM Proxy."
-            : "Connect through the MCP Gateway to expose tools with unified discovery and observability."
-        }
-      >
-        <TabsList
-          className={
-            agentType === "profile"
-              ? "grid h-auto w-full grid-cols-2 gap-2 bg-transparent p-0"
-              : "grid h-auto w-full grid-cols-1 gap-2 bg-transparent p-0"
-          }
-        >
-          <TabsTrigger
-            value="mcp"
-            className="flex h-auto min-h-20 flex-col items-start gap-2 rounded-lg border px-4 py-3 text-left data-[state=active]:border-green-500/30 data-[state=active]:bg-green-500/5 data-[state=active]:shadow-none"
-          >
-            <div className="flex items-center gap-2">
-              <Route className="h-4 w-4 text-green-500" />
-              <span className="font-medium">MCP Gateway</span>
-            </div>
-            <div className="flex flex-wrap gap-1.5">
-              <div className="flex items-center gap-1 rounded-full border bg-background/60 px-2 py-1 text-[10px]">
-                <Server className="h-2.5 w-2.5 text-green-600 dark:text-green-400" />
-                <span>Unified MCP</span>
-              </div>
-              <div className="flex items-center gap-1 rounded-full border bg-background/60 px-2 py-1 text-[10px]">
-                <Eye className="h-2.5 w-2.5 text-purple-600 dark:text-purple-400" />
-                <span>Observability</span>
-              </div>
-            </div>
-          </TabsTrigger>
-
-          {agentType === "profile" ? (
-            <TabsTrigger
-              value="proxy"
-              className="flex h-auto min-h-20 flex-col items-start gap-2 rounded-lg border px-4 py-3 text-left data-[state=active]:border-blue-500/30 data-[state=active]:bg-blue-500/5 data-[state=active]:shadow-none"
-            >
-              <div className="flex items-center gap-2">
-                <Server className="h-4 w-4 text-blue-500" />
-                <span className="font-medium">LLM Proxy</span>
-              </div>
-              <div className="flex flex-wrap gap-1.5">
-                <div className="flex items-center gap-1 rounded-full border bg-background/60 px-2 py-1 text-[10px]">
-                  <Eye className="h-2.5 w-2.5 text-purple-600 dark:text-purple-400" />
-                  <span>Observability</span>
-                </div>
-                <div className="flex items-center gap-1 rounded-full border bg-background/60 px-2 py-1 text-[10px]">
-                  <DollarSign className="h-2.5 w-2.5 text-green-600 dark:text-green-400" />
-                  <span>Cost</span>
-                </div>
-              </div>
-            </TabsTrigger>
-          ) : null}
-        </TabsList>
-      </ConnectDialogSection>
-
-      <TabsContent value="mcp" className="mt-0">
-        <ConnectDialogSection
-          title="MCP Gateway Instructions"
-          description="Use the MCP endpoint and token configuration for tool discovery and execution."
-        >
-          <div className="min-w-0">
-            <McpConnectionInstructions agentId={agentId} hideProfileSelector />
-          </div>
-        </ConnectDialogSection>
-      </TabsContent>
-
-      {agentType === "profile" ? (
-        <TabsContent value="proxy" className="mt-0">
-          <ConnectDialogSection
-            title="LLM Proxy Instructions"
-            description="Choose a provider and point your client at the proxy for model requests."
-          >
-            <div className="min-w-0">
-              <ProxyConnectionInstructions agentId={agentId} />
-            </div>
-          </ConnectDialogSection>
-        </TabsContent>
-      ) : null}
-    </Tabs>
-  );
-}
-
-function ConnectGatewayDialog({
-  agent,
-  open,
-  onOpenChange,
-}: {
-  agent: {
-    id: string;
-    name: string;
-    agentType: AgentType;
-  };
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-}) {
-  return (
-    <ConnectDialog
-      agent={agent}
-      open={open}
-      onOpenChange={onOpenChange}
-      docsPage="platform-mcp-gateway"
-    >
-      <GatewayConnectionColumns
-        agentId={agent.id}
-        agentType={agent.agentType}
-      />
-    </ConnectDialog>
   );
 }
 

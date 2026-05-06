@@ -3,6 +3,7 @@ import {
   AgentTeamModel,
   ChatOpsChannelBindingModel,
   ChatOpsConfigModel,
+  ChatOpsThreadAgentOverrideModel,
 } from "@/models";
 import { afterEach, beforeEach, describe, expect, test, vi } from "@/test";
 import type {
@@ -186,6 +187,8 @@ describe("ChatOpsManager security validation", () => {
       notifyMissingScopes: overrides.notifyMissingScopes ?? (async () => {}),
       downloadFiles: async () => [],
       discoverChannels: async () => null,
+      addApprovalRequestForm: async () => {},
+      updateApprovalRequest: async () => {},
     };
   }
 
@@ -197,6 +200,11 @@ describe("ChatOpsManager security validation", () => {
       text: "Agent response",
       messageId: "test-message-id",
       finishReason: "stop",
+      responseUiMessage: {
+        id: "test-message-id",
+        role: "assistant",
+        parts: [{ type: "text", text: "Agent response" }],
+      },
     });
   }
 
@@ -848,6 +856,8 @@ describe("ChatOpsManager.handleIncomingMessage empty Slack mention", () => {
       notifyMissingScopes: async () => {},
       downloadFiles: async () => [],
       discoverChannels: async () => [],
+      addApprovalRequestForm: async () => {},
+      updateApprovalRequest: async () => {},
     };
 
     const manager = new ChatOpsManager();
@@ -915,6 +925,8 @@ describe("ChatOpsManager.handleIncomingMessage missing scope notification", () =
       notifyMissingScopes: overrides.notifyMissingScopes ?? (async () => {}),
       downloadFiles: async () => [],
       discoverChannels: async () => null,
+      addApprovalRequestForm: async () => {},
+      updateApprovalRequest: async () => {},
     };
   }
 
@@ -1375,6 +1387,8 @@ describe("ChatOpsManager attachment passthrough", () => {
       notifyMissingScopes: async () => {},
       downloadFiles: async () => [],
       discoverChannels: async () => null,
+      addApprovalRequestForm: async () => {},
+      updateApprovalRequest: async () => {},
     };
   }
 
@@ -1408,6 +1422,11 @@ describe("ChatOpsManager attachment passthrough", () => {
         text: "I see the image",
         messageId: "msg-1",
         finishReason: "stop",
+        responseUiMessage: {
+          id: "msg-1",
+          role: "assistant",
+          parts: [{ type: "text", text: "response" }],
+        },
       });
 
     const user = await makeUser({ email: "attach-user@example.com" });
@@ -1440,12 +1459,14 @@ describe("ChatOpsManager attachment passthrough", () => {
     const testAttachments = [
       {
         contentType: "image/png",
-        contentBase64: "iVBORw0KGgo=",
+        contentBase64: Buffer.alloc(10_000).toString("base64"),
         name: "screenshot.png",
       },
       {
-        contentType: "application/pdf",
-        contentBase64: "JVBERi0x",
+        // Don't use PDF because A2A message executor doesn't support it right now
+        // contentType: "application/pdf",
+        contentType: "image/jpg",
+        contentBase64: Buffer.alloc(10_000).toString("base64"),
         name: "report.pdf",
       },
     ];
@@ -1459,7 +1480,20 @@ describe("ChatOpsManager attachment passthrough", () => {
     expect(result.success).toBe(true);
     expect(executorSpy).toHaveBeenCalledWith(
       expect.objectContaining({
-        attachments: testAttachments,
+        messages: expect.arrayContaining([
+          expect.objectContaining({
+            content: expect.arrayContaining([
+              expect.objectContaining({
+                type: "file",
+                mediaType: "image/png",
+              }),
+              expect.objectContaining({
+                type: "file",
+                mediaType: "image/jpg",
+              }),
+            ]),
+          }),
+        ]),
       }),
     );
   });
@@ -1477,6 +1511,11 @@ describe("ChatOpsManager attachment passthrough", () => {
         text: "Plain response",
         messageId: "msg-2",
         finishReason: "stop",
+        responseUiMessage: {
+          id: "msg-2",
+          role: "assistant",
+          parts: [{ type: "text", text: "Plain response" }],
+        },
       });
 
     const user = await makeUser({ email: "noattach@example.com" });
@@ -1509,11 +1548,12 @@ describe("ChatOpsManager attachment passthrough", () => {
     const message = createMockMessage(); // no attachments
     await manager.processMessage({ message, provider: mockProvider });
 
-    expect(executorSpy).toHaveBeenCalledWith(
-      expect.objectContaining({
-        attachments: undefined,
-      }),
-    );
+    const callArg = executorSpy.mock.calls[0][0];
+    for (const message of callArg.messages || []) {
+      expect(message.content).not.toEqual(
+        expect.arrayContaining([expect.objectContaining({ type: "file" })]),
+      );
+    }
   });
 
   test("includes image attachments from thread history in follow-up messages", async ({
@@ -1525,7 +1565,7 @@ describe("ChatOpsManager attachment passthrough", () => {
   }) => {
     const historyImageAttachment = {
       contentType: "image/png",
-      contentBase64: "iVBORw0KGgoAAAA=",
+      contentBase64: Buffer.alloc(10_000).toString("base64"),
       name: "photo.png",
     };
 
@@ -1535,6 +1575,11 @@ describe("ChatOpsManager attachment passthrough", () => {
         text: "I can see the photo from earlier",
         messageId: "msg-3",
         finishReason: "stop",
+        responseUiMessage: {
+          id: "msg-1",
+          role: "assistant",
+          parts: [{ type: "text", text: "response" }],
+        },
       });
 
     const user = await makeUser({ email: "history-attach@example.com" });
@@ -1609,9 +1654,328 @@ describe("ChatOpsManager attachment passthrough", () => {
     // The image from thread history should be included in the A2A call
     expect(executorSpy).toHaveBeenCalledWith(
       expect.objectContaining({
-        attachments: [historyImageAttachment],
+        messages: expect.arrayContaining([
+          expect.objectContaining({
+            content: expect.arrayContaining([
+              expect.objectContaining({
+                type: "file",
+                mediaType: historyImageAttachment.contentType,
+              }),
+            ]),
+          }),
+        ]),
       }),
     );
+  });
+
+  test("hands off to swapped chatops agent in the same turn", async ({
+    makeUser,
+    makeOrganization,
+    makeTeam,
+    makeTeamMember,
+    makeInternalAgent,
+  }) => {
+    const user = await makeUser({ email: "swap-handoff@example.com" });
+    const org = await makeOrganization();
+    const team = await makeTeam(org.id, user.id);
+    await makeTeamMember(team.id, user.id);
+
+    const routerAgent = await makeInternalAgent({
+      organizationId: org.id,
+      name: "Router Agent",
+      teams: [team.id],
+    });
+    await AgentTeamModel.assignTeamsToAgent(routerAgent.id, [team.id]);
+
+    const specialistAgent = await makeInternalAgent({
+      organizationId: org.id,
+      name: "Specialist Agent",
+      teams: [team.id],
+    });
+    await AgentTeamModel.assignTeamsToAgent(specialistAgent.id, [team.id]);
+
+    const binding = await ChatOpsChannelBindingModel.create({
+      organizationId: org.id,
+      provider: "ms-teams",
+      channelId: "test-channel-id",
+      workspaceId: "test-workspace-id",
+      agentId: routerAgent.id,
+    });
+
+    const executorSpy = vi
+      .spyOn(a2aExecutor, "executeA2AMessage")
+      .mockImplementation(async (params) => {
+        if (params.agentId === routerAgent.id) {
+          if (!params.chatOpsThreadId) {
+            throw new Error("Expected chatOpsThreadId");
+          }
+          // Simulate swap_agent creating a thread override
+          await ChatOpsThreadAgentOverrideModel.upsert(
+            binding.id,
+            params.chatOpsThreadId,
+            specialistAgent.id,
+          );
+          return {
+            text: "",
+            messageId: "router-msg",
+            finishReason: "stop",
+            responseUiMessage: {
+              id: "router-msg",
+              role: "assistant",
+              parts: [{ type: "text", text: "" }],
+            },
+          };
+        }
+
+        if (params.agentId === specialistAgent.id) {
+          return {
+            text: "Specialist response",
+            messageId: "specialist-msg",
+            finishReason: "stop",
+            responseUiMessage: {
+              id: "specialist-msg",
+              role: "assistant",
+              parts: [{ type: "text", text: "Specialist response" }],
+            },
+          };
+        }
+
+        throw new Error(`Unexpected agentId: ${params.agentId}`);
+      });
+
+    const sendReplySpy = vi.fn().mockResolvedValue("reply-id");
+    const mockProvider = createMockProvider({
+      getUserEmail: async () => "swap-handoff@example.com",
+      sendReply: sendReplySpy,
+    });
+
+    const manager = new ChatOpsManager();
+    (
+      manager as unknown as { msTeamsProvider: ChatOpsProvider }
+    ).msTeamsProvider = mockProvider;
+
+    const message = createMockMessage({
+      text: "Please route this to the right expert",
+    });
+
+    const result = await manager.processMessage({
+      message,
+      provider: mockProvider,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.agentResponse).toBe("Specialist response");
+
+    expect(executorSpy).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        agentId: routerAgent.id,
+        chatOpsBindingId: binding.id,
+      }),
+    );
+    expect(executorSpy).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        agentId: specialistAgent.id,
+        chatOpsBindingId: binding.id,
+      }),
+    );
+
+    expect(sendReplySpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: "Specialist response",
+        footer: `🤖 ${specialistAgent.name}`,
+      }),
+    );
+  });
+
+  test("does not replay swap request into new agent when router replies", async ({
+    makeUser,
+    makeOrganization,
+    makeTeam,
+    makeTeamMember,
+    makeInternalAgent,
+  }) => {
+    const user = await makeUser({ email: "swap-reply@example.com" });
+    const org = await makeOrganization();
+    const team = await makeTeam(org.id, user.id);
+    await makeTeamMember(team.id, user.id);
+
+    const routerAgent = await makeInternalAgent({
+      organizationId: org.id,
+      name: "Router Agent",
+      teams: [team.id],
+    });
+    await AgentTeamModel.assignTeamsToAgent(routerAgent.id, [team.id]);
+
+    const specialistAgent = await makeInternalAgent({
+      organizationId: org.id,
+      name: "French Agent",
+      teams: [team.id],
+    });
+    await AgentTeamModel.assignTeamsToAgent(specialistAgent.id, [team.id]);
+
+    const binding = await ChatOpsChannelBindingModel.create({
+      organizationId: org.id,
+      provider: "ms-teams",
+      channelId: "test-channel-id",
+      workspaceId: "test-workspace-id",
+      agentId: routerAgent.id,
+    });
+
+    const executorSpy = vi
+      .spyOn(a2aExecutor, "executeA2AMessage")
+      .mockImplementation(async (params) => {
+        if (params.agentId === routerAgent.id) {
+          if (!params.chatOpsThreadId) {
+            throw new Error("Expected chatOpsThreadId");
+          }
+          // Simulate swap_agent creating a thread override
+          await ChatOpsThreadAgentOverrideModel.upsert(
+            binding.id,
+            params.chatOpsThreadId,
+            specialistAgent.id,
+          );
+          return {
+            text: "Switched to French Agent. Bonjour!",
+            messageId: "router-msg",
+            finishReason: "stop",
+            responseUiMessage: {
+              id: "router-msg",
+              role: "assistant",
+              parts: [
+                { type: "text", text: "Switched to French Agent. Bonjour!" },
+              ],
+            },
+          };
+        }
+
+        throw new Error(`Unexpected handoff to agentId: ${params.agentId}`);
+      });
+
+    const sendReplySpy = vi.fn().mockResolvedValue("reply-id");
+    const mockProvider = createMockProvider({
+      getUserEmail: async () => "swap-reply@example.com",
+      sendReply: sendReplySpy,
+    });
+
+    const manager = new ChatOpsManager();
+    (
+      manager as unknown as { msTeamsProvider: ChatOpsProvider }
+    ).msTeamsProvider = mockProvider;
+
+    const result = await manager.processMessage({
+      message: createMockMessage({ text: "switch me to french agent" }),
+      provider: mockProvider,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.agentResponse).toBe("Switched to French Agent. Bonjour!");
+    expect(executorSpy).toHaveBeenCalledTimes(1);
+
+    // Channel binding should NOT be mutated (swap is thread-scoped)
+    const updatedBinding = await ChatOpsChannelBindingModel.findById(
+      binding.id,
+    );
+    expect(updatedBinding?.agentId).toBe(routerAgent.id);
+
+    expect(sendReplySpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: "Switched to French Agent. Bonjour!",
+        footer: `🤖 ${specialistAgent.name}`,
+      }),
+    );
+  });
+
+  test("thread override persists across turns — second message uses swapped agent", async ({
+    makeUser,
+    makeOrganization,
+    makeTeam,
+    makeTeamMember,
+    makeInternalAgent,
+  }) => {
+    const user = await makeUser({ email: "persist-turn@example.com" });
+    const org = await makeOrganization();
+    const team = await makeTeam(org.id, user.id);
+    await makeTeamMember(team.id, user.id);
+
+    const routerAgent = await makeInternalAgent({
+      organizationId: org.id,
+      name: "Router Agent",
+      teams: [team.id],
+    });
+    await AgentTeamModel.assignTeamsToAgent(routerAgent.id, [team.id]);
+
+    const specialistAgent = await makeInternalAgent({
+      organizationId: org.id,
+      name: "Specialist Agent",
+      teams: [team.id],
+    });
+    await AgentTeamModel.assignTeamsToAgent(specialistAgent.id, [team.id]);
+
+    const binding = await ChatOpsChannelBindingModel.create({
+      organizationId: org.id,
+      provider: "ms-teams",
+      channelId: "test-channel-id",
+      workspaceId: "test-workspace-id",
+      agentId: routerAgent.id,
+    });
+
+    // Pre-create a thread override (simulates a swap_agent call in a prior turn)
+    await ChatOpsThreadAgentOverrideModel.upsert(
+      binding.id,
+      "test-channel-id", // effectiveThreadId for a top-level MS Teams message
+      specialistAgent.id,
+    );
+
+    const executorSpy = vi
+      .spyOn(a2aExecutor, "executeA2AMessage")
+      .mockResolvedValue({
+        text: "Specialist second-turn response",
+        messageId: "msg-turn2",
+        finishReason: "stop",
+        responseUiMessage: {
+          id: "msg-turn2",
+          role: "assistant",
+          parts: [{ type: "text", text: "Specialist second-turn response" }],
+        },
+      });
+
+    const mockProvider = createMockProvider({
+      getUserEmail: async () => "persist-turn@example.com",
+    });
+
+    const manager = new ChatOpsManager();
+    (
+      manager as unknown as { msTeamsProvider: ChatOpsProvider }
+    ).msTeamsProvider = mockProvider;
+
+    // Second message in the same thread — no swap, just a follow-up
+    const message = createMockMessage({
+      text: "follow up question",
+    });
+
+    const result = await manager.processMessage({
+      message,
+      provider: mockProvider,
+    });
+
+    expect(result.success).toBe(true);
+
+    // The A2A call should use the specialist agent (from the thread override),
+    // not the router agent (channel binding default)
+    expect(executorSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: specialistAgent.id,
+        chatOpsBindingId: binding.id,
+      }),
+    );
+
+    // Channel binding should still point to the router
+    const unchangedBinding = await ChatOpsChannelBindingModel.findById(
+      binding.id,
+    );
+    expect(unchangedBinding?.agentId).toBe(routerAgent.id);
   });
 });
 

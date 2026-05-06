@@ -40,6 +40,7 @@ import { extractAndIngestDocuments } from "@/knowledge-base";
 import logger from "@/logging";
 import {
   AgentModel,
+  ConversationChatErrorModel,
   ConversationEnabledToolModel,
   ConversationModel,
   ConversationShareModel,
@@ -449,6 +450,10 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
                 const errorForFrontend = slimChatErrorUi
                   ? sanitizeChatErrorForFrontend(fullError)
                   : fullError;
+                persistConversationChatError({
+                  conversationId,
+                  error: errorForFrontend,
+                });
 
                 logger.info(
                   {
@@ -645,10 +650,54 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
                   }
                 }
 
+                // toUIMessageStream invokes onError twice for the same upstream
+                // error (once when formatting the error chunk's errorText, once
+                // as a notification when the chunk is walked downstream). Guard
+                // so we don't persist or log the same error twice.
+                let chatErrorHandled = false;
+                let serializedChatError = "";
+
                 writer.merge(
                   result.toUIMessageStream({
                     originalMessages: messages as UIMessage[],
                     onError: (error) => {
+                      if (chatErrorHandled) {
+                        return serializedChatError;
+                      }
+                      chatErrorHandled = true;
+
+                      const traceContext = getActiveTraceContext();
+                      const correlationLogFields =
+                        getCorrelationLogFields(traceContext);
+
+                      // Use pre-built error from subagent if available (preserves correct provider),
+                      // otherwise map the error with the current provider
+                      const mappedError: ChatErrorResponse =
+                        error instanceof ProviderError
+                          ? error.chatErrorResponse
+                          : mapProviderError(error, provider);
+                      const fullError = { ...mappedError, ...traceContext };
+                      const errorForFrontend = slimChatErrorUi
+                        ? sanitizeChatErrorForFrontend(fullError)
+                        : fullError;
+
+                      // mapProviderError safely serializes raw errors, but add defensive try-catch
+                      try {
+                        serializedChatError = JSON.stringify(errorForFrontend);
+                      } catch (stringifyError) {
+                        logger.error(
+                          {
+                            stringifyError,
+                            errorCode: mappedError.code,
+                            ...correlationLogFields,
+                          },
+                          "Failed to stringify mapped error, returning minimal error",
+                        );
+                        serializedChatError = JSON.stringify(
+                          getMinimalFrontendError(errorForFrontend),
+                        );
+                      }
+
                       // Claim persistence before the async work below starts,
                       // otherwise onFinish can race and also persist (duplicates).
                       const shouldPersist =
@@ -656,9 +705,6 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
                       if (shouldPersist) {
                         messagesPersisted = true;
                       }
-                      const traceContext = getActiveTraceContext();
-                      const correlationLogFields =
-                        getCorrelationLogFields(traceContext);
 
                       (async () => {
                         logger.error(
@@ -695,16 +741,10 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
                         );
                       });
 
-                      // Use pre-built error from subagent if available (preserves correct provider),
-                      // otherwise map the error with the current provider
-                      const mappedError: ChatErrorResponse =
-                        error instanceof ProviderError
-                          ? error.chatErrorResponse
-                          : mapProviderError(error, provider);
-                      const fullError = { ...mappedError, ...traceContext };
-                      const errorForFrontend = slimChatErrorUi
-                        ? sanitizeChatErrorForFrontend(fullError)
-                        : fullError;
+                      persistConversationChatError({
+                        conversationId,
+                        error: errorForFrontend,
+                      });
 
                       logger.info(
                         {
@@ -717,22 +757,7 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
                         "Returning mapped error to frontend via stream",
                       );
 
-                      // mapProviderError safely serializes raw errors, but add defensive try-catch
-                      try {
-                        return JSON.stringify(errorForFrontend);
-                      } catch (stringifyError) {
-                        logger.error(
-                          {
-                            stringifyError,
-                            errorCode: mappedError.code,
-                            ...correlationLogFields,
-                          },
-                          "Failed to stringify mapped error, returning minimal error",
-                        );
-                        return JSON.stringify(
-                          getMinimalFrontendError(errorForFrontend),
-                        );
-                      }
+                      return serializedChatError;
                     },
                     onFinish: async ({ messages: finalMessages }) => {
                       removeAbortListeners();
@@ -2021,6 +2046,31 @@ async function persistNewMessages(
   }
 }
 
+function persistConversationChatError(params: {
+  conversationId: string;
+  error: ChatErrorResponse;
+}) {
+  const chatError = getSerializableChatError(params.error);
+
+  void ConversationChatErrorModel.create({
+    conversationId: params.conversationId,
+    error: chatError,
+  }).catch((error) => {
+    logger.error(
+      { error, conversationId: params.conversationId },
+      "Failed to persist chat error event on conversation",
+    );
+  });
+}
+
+function getSerializableChatError(error: ChatErrorResponse): ChatErrorResponse {
+  try {
+    return JSON.parse(JSON.stringify(error)) as ChatErrorResponse;
+  } catch {
+    return getMinimalFrontendError(error);
+  }
+}
+
 function getMessagesNotYetPersisted(params: {
   existingMessages: Array<{ id: string; content: unknown }>;
   uiMessages: ChatMessage[];
@@ -2062,32 +2112,116 @@ function prepareMessagesForProvider(params: {
 }): ChatMessage[] {
   const { messages, provider } = params;
 
-  if (provider !== "anthropic") {
-    return messages;
+  if (provider === "anthropic") {
+    return messages.map(normalizeAnthropicMessageFileParts);
   }
 
-  return messages.map((message) => {
-    if (!message.parts?.length) {
-      return message;
-    }
+  if (provider === "bedrock") {
+    return messages.map((message) =>
+      ensureBedrockMessageHasContent(
+        ensureBedrockUserMessageHasTextPart(message),
+      ),
+    );
+  }
 
-    let changed = false;
-    const parts = message.parts.map((part) => {
-      const normalizedPart = normalizeAnthropicFilePart(part);
-      if (normalizedPart !== part) {
-        changed = true;
-      }
-      return normalizedPart;
-    });
-
-    return changed
-      ? {
-          ...message,
-          parts,
-        }
-      : message;
-  });
+  return messages;
 }
+
+function normalizeAnthropicMessageFileParts(message: ChatMessage): ChatMessage {
+  if (!message.parts?.length) {
+    return message;
+  }
+
+  let changed = false;
+  const parts = message.parts.map((part) => {
+    const normalizedPart = normalizeAnthropicFilePart(part);
+    if (normalizedPart !== part) {
+      changed = true;
+    }
+    return normalizedPart;
+  });
+
+  return changed ? { ...message, parts } : message;
+}
+
+// Bedrock rejects user messages that contain a file/document block but no text
+// block ("A text block must be included when using documents."). When the user
+// sends a file with an empty prompt, prepend a placeholder so the request is
+// accepted.
+function ensureBedrockUserMessageHasTextPart(
+  message: ChatMessage,
+): ChatMessage {
+  if (message.role !== "user" || !message.parts?.length) {
+    return message;
+  }
+
+  let hasFilePart = false;
+  let hasNonEmptyTextPart = false;
+  for (const part of message.parts) {
+    if (part.type === "file") {
+      hasFilePart = true;
+    } else if (
+      part.type === "text" &&
+      typeof part.text === "string" &&
+      part.text.trim().length > 0
+    ) {
+      hasNonEmptyTextPart = true;
+    }
+  }
+
+  if (!hasFilePart || hasNonEmptyTextPart) {
+    return message;
+  }
+
+  return {
+    ...message,
+    parts: [
+      { type: "text", text: BEDROCK_DOCUMENT_PLACEHOLDER_TEXT },
+      ...message.parts,
+    ],
+  };
+}
+
+// Bedrock also rejects messages whose content array is empty after the AI SDK
+// drops empty text blocks and reasoning blocks without a signature ("The
+// content field in the Message object at messages.N is empty"). Pad with
+// placeholder text so turn alternation is preserved.
+function ensureBedrockMessageHasContent(message: ChatMessage): ChatMessage {
+  if (message.role === "system" || message.role === "tool") {
+    return message;
+  }
+  if (message.parts?.some(producesBedrockContentBlock)) {
+    return message;
+  }
+
+  const placeholder = {
+    type: "text",
+    text: BEDROCK_EMPTY_CONTENT_PLACEHOLDER_TEXT,
+  };
+  return {
+    ...message,
+    parts: message.parts ? [...message.parts, placeholder] : [placeholder],
+  };
+}
+
+// Mirrors the AI SDK's bedrock converter: text/reasoning blocks without usable
+// payload are silently dropped; everything else (tool-call, tool-result, file,
+// image) always produces a content block.
+function producesBedrockContentBlock(part: ChatMessagePart): boolean {
+  if (part.type === "text") {
+    return typeof part.text === "string" && part.text.trim().length > 0;
+  }
+  if (part.type === "reasoning") {
+    const bedrock = (part.providerOptions as { bedrock?: unknown } | undefined)
+      ?.bedrock as { signature?: unknown; redactedData?: unknown } | undefined;
+    return Boolean(bedrock?.signature || bedrock?.redactedData);
+  }
+  return true;
+}
+
+const BEDROCK_DOCUMENT_PLACEHOLDER_TEXT =
+  "Please review the attached document.";
+const BEDROCK_EMPTY_CONTENT_PLACEHOLDER_TEXT = "(no content)";
 
 function normalizeAnthropicFilePart(part: ChatMessagePart): ChatMessagePart {
   if (

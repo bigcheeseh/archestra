@@ -6,6 +6,8 @@ import {
   ARCHESTRA_TOKEN_PREFIX,
   AUTO_PROVISIONED_INVITATION_STATUS,
   DEFAULT_APP_NAME,
+  emailMatchesAllowedIdentityProviderDomains,
+  getEmailDomain,
   IDENTITY_TRUSTED_PROVIDER_IDS,
   OAUTH_PAGES,
   OAUTH_SCOPES,
@@ -27,10 +29,12 @@ import db, { schema } from "@/database";
 import logger from "@/logging";
 import { LOG_LEVEL } from "@/logging/log-level";
 // Import directly from files to avoid circular dependency through barrel export
+import AccountModel from "@/models/account";
 import AgentModel from "@/models/agent";
 import InvitationModel from "@/models/invitation";
 import MemberModel from "@/models/member";
 import SessionModel from "@/models/session";
+import UserModel from "@/models/user";
 
 const { ssoConfig, syncSsoRole, syncSsoTeams } = config.enterpriseFeatures.core
   ? // biome-ignore lint/style/noRestrictedImports: EE-only SSO config
@@ -155,10 +159,15 @@ export const auth = betterAuth({
       },
       permissions: {
         /**
-         * NOTE: for now we will just grant all permissions to all API keys
+         * Better Auth applies these defaults to new API keys and uses them
+         * when `verifyApiKey` is called with a `permissions` body. Archestra
+         * route authorization does not rely on the stored key permissions;
+         * API-key requests are checked against the key owner's current RBAC
+         * permissions in hasPermission.
          *
-         * If we'd like to allow granting "scopes" to API keys, we will need to implement a more complex API-key
-         * permissions system/UI
+         * Docs:
+         * - https://better-auth.com/docs/plugins/api-key/reference#permissions
+         * - https://better-auth.com/docs/plugins/api-key/advanced#sessions-from-api-keys
          */
         defaultPermissions: allAvailableActions,
       },
@@ -263,6 +272,26 @@ export const auth = betterAuth({
   },
 
   databaseHooks: {
+    user: {
+      delete: {
+        before: async (user: { id: string }) => {
+          // The agents.author_id FK uses ON DELETE SET NULL so non-personal agents
+          // keep their authorship history. Personal MCP gateways must NOT survive
+          // the user — the deletion guard in routes/agent.ts blocks DELETE while
+          // is_personal_gateway = true, so an orphaned row would be undeletable.
+          // Swallow errors so a transient cleanup failure doesn't block the
+          // user-deletion flow; an admin can still clean up manually if needed.
+          try {
+            await AgentModel.deletePersonalMcpGatewaysForUser(user.id);
+          } catch (error) {
+            logger.error(
+              { err: error, userId: user.id },
+              "[databaseHooks:user] Failed to delete personal MCP gateways",
+            );
+          }
+        },
+      },
+    },
     session: {
       create: {
         before: async (session) => {
@@ -470,6 +499,7 @@ function shouldTrustAllOriginsForIdentityProviderRegistration(
  * - Blocking invitations when disabled via environment variable
  * - Email validation for invitation requests
  * - Invitation-only sign-up enforcement
+ * @public — exported for testability
  */
 export async function handleBeforeHook(ctx: HookEndpointContext) {
   const { path, method, body } = ctx;
@@ -678,6 +708,7 @@ export async function handleBeforeHook(ctx: HookEndpointContext) {
  * - Accepting invitations after sign-up
  * - Auto-accepting pending invitations on sign-in
  * - Setting active organization for new sessions
+ * @public — exported for testability
  */
 export async function handleAfterHook(ctx: HookEndpointContext) {
   const { path, method, body, context, request } = ctx;
@@ -775,6 +806,22 @@ export async function handleAfterHook(ctx: HookEndpointContext) {
         "[auth:afterHook] Processing sign-in/SSO callback",
       );
 
+      const providerIdHint = path.startsWith("/sso/callback")
+        ? getSsoCallbackProviderId({
+            path,
+            requestUrl: request?.url,
+          })
+        : undefined;
+
+      if (providerIdHint) {
+        await assertSsoEmailDomainAllowed({
+          providerId: providerIdHint,
+          userEmail: user.email,
+          userId,
+          sessionId,
+        });
+      }
+
       // Auto-accept any pending invitations for this user's email
       try {
         const pendingInvitation = await InvitationModel.findPendingByEmail(
@@ -844,16 +891,22 @@ export async function handleAfterHook(ctx: HookEndpointContext) {
             "Failed to ensure personal chat agent on sign-in",
           );
         }
+        try {
+          await AgentModel.ensurePersonalMcpGateway({
+            userId,
+            organizationId: orgId,
+          });
+        } catch (error) {
+          logger.error(
+            { err: error },
+            "Failed to ensure personal MCP gateway on sign-in",
+          );
+        }
       }
 
       // SSO Role & Team Sync: Synchronize role and team memberships based on SSO claims
       // Only applies to SSO logins (not regular email/password logins)
       if (path.startsWith("/sso/callback")) {
-        const providerIdHint = getSsoCallbackProviderId({
-          path,
-          requestUrl: request?.url,
-        });
-
         logger.debug(
           { userId, email: user.email, providerIdHint },
           "[auth:afterHook] Processing SSO role and team sync",
@@ -902,4 +955,87 @@ function getSsoCallbackProviderId(params: {
   }
 
   return providerId || undefined;
+}
+
+async function assertSsoEmailDomainAllowed(params: {
+  providerId: string;
+  userEmail: string;
+  userId: string;
+  sessionId: string;
+}) {
+  if (!config.enterpriseFeatures.core) {
+    return;
+  }
+
+  const { default: IdentityProviderModel } = await import(
+    // biome-ignore lint/style/noRestrictedImports: runtime-gated EE model import
+    "@/models/identity-provider.ee"
+  );
+  const provider = await IdentityProviderModel.findByProviderId(
+    params.providerId,
+  );
+
+  if (!provider?.domain) {
+    return;
+  }
+
+  if (
+    emailMatchesAllowedIdentityProviderDomains(
+      params.userEmail,
+      provider.domain,
+    )
+  ) {
+    return;
+  }
+
+  await cleanupRejectedSsoLogin({
+    providerId: params.providerId,
+    organizationId: provider.organizationId,
+    userId: params.userId,
+    sessionId: params.sessionId,
+  });
+  logger.warn(
+    {
+      providerId: params.providerId,
+      emailDomain: getEmailDomain(params.userEmail),
+      providerDomain: provider.domain,
+    },
+    "[auth:afterHook] SSO login denied because user email domain does not match identity provider domain",
+  );
+
+  throw new APIError("FORBIDDEN", {
+    message: "Your email domain is not allowed for this identity provider.",
+  });
+}
+
+async function cleanupRejectedSsoLogin(params: {
+  providerId: string;
+  organizationId: string | null;
+  userId: string;
+  sessionId: string;
+}) {
+  await db.transaction(async (tx) => {
+    await SessionModel.deleteById(params.sessionId, tx);
+    await AccountModel.deleteByUserIdAndProviderId({
+      userId: params.userId,
+      providerId: params.providerId,
+      tx,
+    });
+
+    const accounts = await AccountModel.getAllByUserId(params.userId, tx);
+
+    if (accounts.length === 0 && params.organizationId) {
+      await MemberModel.deleteByMemberOrUserId(
+        params.userId,
+        params.organizationId,
+        tx,
+      );
+    }
+
+    const hasMembership = await MemberModel.hasAnyMembership(params.userId, tx);
+
+    if (accounts.length === 0 && !hasMembership) {
+      await UserModel.delete(params.userId, tx);
+    }
+  });
 }

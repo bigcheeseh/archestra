@@ -4,6 +4,7 @@ import type { LocalServerInstallResult } from "@/app/mcp/registry/_parts/local-s
 import type { CatalogItem } from "@/app/mcp/registry/_parts/mcp-server-card";
 import type { NoAuthInstallResult } from "@/app/mcp/registry/_parts/no-auth-install-dialog";
 import type { RemoteServerInstallResult } from "@/app/mcp/registry/_parts/remote-server-install-dialog";
+import type { McpServerInstallScope } from "@/app/mcp/registry/_parts/select-mcp-server-credential-type-and-teams";
 import type { OAuthInstallResult } from "@/components/oauth-confirmation-dialog";
 import { useInitiateOAuth } from "@/lib/auth/oauth.query";
 import {
@@ -15,6 +16,7 @@ import {
   setOAuthMcpServerId,
   setOAuthPendingAfterEnvVars,
   setOAuthReturnUrl,
+  setOAuthScope,
   setOAuthServerType,
   setOAuthState,
   setOAuthTeamId,
@@ -27,6 +29,7 @@ import {
   useMcpServers,
   useReauthenticateMcpServer,
 } from "@/lib/mcp/mcp-server.query";
+import { buildRemoteInstallCredentialPayload } from "@/lib/mcp/remote-install-payload";
 import { redirectBrowserToUrl } from "@/lib/utils/browser-redirect";
 
 type DialogKey =
@@ -66,6 +69,7 @@ export function useMcpInstallOrchestrator() {
   const initiateOAuthRedirect = useCallback(
     async (params: {
       catalogItem: CatalogItem;
+      scope?: McpServerInstallScope;
       teamId?: string | null;
       reauthServerId?: string | null;
     }) => {
@@ -75,9 +79,13 @@ export function useMcpInstallOrchestrator() {
             catalogId: params.catalogItem.id,
           });
 
+        const scope: McpServerInstallScope =
+          params.scope ?? (params.teamId ? "team" : "personal");
+
         setOAuthState(state);
         setOAuthCatalogId(params.catalogItem.id);
-        setOAuthTeamId(params.teamId ?? null);
+        setOAuthTeamId(scope === "team" ? (params.teamId ?? null) : null);
+        setOAuthScope(scope);
 
         if (params.reauthServerId) {
           setOAuthMcpServerId(params.reauthServerId);
@@ -218,28 +226,14 @@ export function useMcpInstallOrchestrator() {
     catalogItem: CatalogItem,
     result: RemoteServerInstallResult,
   ) => {
+    const credentialPayload = buildRemoteInstallCredentialPayload(result);
+
     // If in reauth mode, call reauthenticate endpoint instead of install
     if (reauthServerId) {
-      const accessToken =
-        !result.isByosVault &&
-        result.metadata?.access_token &&
-        typeof result.metadata.access_token === "string"
-          ? result.metadata.access_token
-          : undefined;
-
       await reauthMutation.mutateAsync({
         id: reauthServerId,
         name: catalogItem.name,
-        ...(accessToken && { accessToken }),
-        ...(result.isByosVault && {
-          userConfigValues: result.metadata as Record<string, string>,
-        }),
-        ...(!result.isByosVault &&
-          !accessToken &&
-          result.metadata && {
-            userConfigValues: result.metadata as Record<string, string>,
-          }),
-        isByosVault: result.isByosVault,
+        ...credentialPayload,
       });
 
       closeDialog("remote-install");
@@ -248,22 +242,13 @@ export function useMcpInstallOrchestrator() {
       return;
     }
 
-    const accessToken =
-      !result.isByosVault &&
-      result.metadata?.access_token &&
-      typeof result.metadata.access_token === "string"
-        ? result.metadata.access_token
-        : undefined;
-
     await installMutation.mutateAsync({
       name: catalogItem.name,
       catalogId: catalogItem.id,
-      ...(accessToken && { accessToken }),
-      ...(result.isByosVault && {
-        userConfigValues: result.metadata as Record<string, string>,
-      }),
-      isByosVault: result.isByosVault,
-      teamId: result.teamId ?? undefined,
+      ...credentialPayload,
+      scope: result.scope,
+      teamId:
+        result.scope === "team" ? (result.teamId ?? undefined) : undefined,
     });
   };
 
@@ -334,7 +319,11 @@ export function useMcpInstallOrchestrator() {
       environmentValues: installResult.environmentValues,
       userConfigValues: installResult.userConfigValues,
       isByosVault: installResult.isByosVault,
-      teamId: installResult.teamId ?? undefined,
+      scope: installResult.scope,
+      teamId:
+        installResult.scope === "team"
+          ? (installResult.teamId ?? undefined)
+          : undefined,
       serviceAccount: installResult.serviceAccount,
     });
 
@@ -348,7 +337,9 @@ export function useMcpInstallOrchestrator() {
     await installMutation.mutateAsync({
       name: noAuthCatalogItem.name,
       catalogId: noAuthCatalogItem.id,
-      teamId: result.teamId ?? undefined,
+      scope: result.scope,
+      teamId:
+        result.scope === "team" ? (result.teamId ?? undefined) : undefined,
     });
     closeDialog("no-auth");
     setNoAuthCatalogItem(null);
@@ -359,6 +350,7 @@ export function useMcpInstallOrchestrator() {
 
     await initiateOAuthRedirect({
       catalogItem: selectedCatalogItem,
+      scope: result.scope,
       teamId: result.teamId,
       reauthServerId,
     });

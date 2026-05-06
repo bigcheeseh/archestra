@@ -33,10 +33,10 @@ const PAGE_CONFIG: Record<string, { title: string; description: string }> = {
     title: "LLM",
     description: "Configure platform-wide LLM defaults and behavior.",
   },
-  "/settings/mcp": {
-    title: "MCP",
+  "/settings/connection": {
+    title: "Connect page",
     description:
-      "Configure organization-wide MCP authentication and token behavior.",
+      'Control what other users see when getting connection instructions on the "Connect" page.',
   },
   "/settings/organization": {
     title: "Organization",

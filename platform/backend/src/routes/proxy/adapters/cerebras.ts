@@ -6,6 +6,7 @@
  *
  * @see https://inference-docs.cerebras.ai/
  */
+import { ArchestraInternalErrorCode } from "@shared";
 import { encode as toonEncode } from "@toon-format/toon";
 import { get } from "lodash-es";
 import OpenAIProvider from "openai";
@@ -1111,6 +1112,7 @@ export const cerebrasAdapterFactory: LLMProvider<
       apiKey,
       baseURL: options.baseUrl,
       fetch: customFetch,
+      defaultHeaders: options.defaultHeaders,
     });
   },
 
@@ -1148,6 +1150,13 @@ export const cerebrasAdapterFactory: LLMProvider<
         }
       },
     };
+  },
+
+  extractInternalCode(error: unknown): ArchestraInternalErrorCode | undefined {
+    if (get(error, "error.code") === "context_length_exceeded") {
+      return ArchestraInternalErrorCode.ContextLengthExceeded;
+    }
+    return undefined;
   },
 
   extractErrorMessage(error: unknown): string {

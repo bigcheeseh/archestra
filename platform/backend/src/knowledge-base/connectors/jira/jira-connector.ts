@@ -46,20 +46,17 @@ export class JiraConnector extends BaseConnector {
   async validateConfig(
     config: Record<string, unknown>,
   ): Promise<{ valid: boolean; error?: string }> {
-    const parsed = parseJiraConfig(config);
-    if (!parsed) {
-      return {
-        valid: false,
-        error:
-          "Invalid Jira configuration: jiraBaseUrl (string) and isCloud (boolean) are required",
-      };
-    }
-
-    if (!/^https?:\/\/.+/.test(parsed.jiraBaseUrl)) {
-      return { valid: false, error: "jiraBaseUrl must be a valid HTTP(S) URL" };
-    }
-
-    return { valid: true };
+    return this.validateConfigWithSchema({
+      config,
+      parser: parseJiraConfig,
+      label: "Jira",
+      invalidConfigError:
+        "Invalid Jira configuration: jiraBaseUrl (string) and isCloud (boolean) are required",
+      extraChecks: (parsed) =>
+        /^https?:\/\/.+/.test(parsed.jiraBaseUrl)
+          ? null
+          : "jiraBaseUrl must be a valid HTTP(S) URL",
+    });
   }
 
   async testConnection(params: {
@@ -71,29 +68,19 @@ export class JiraConnector extends BaseConnector {
       return { success: false, error: "Invalid Jira configuration" };
     }
 
-    this.log.info(
-      { baseUrl: parsed.jiraBaseUrl, isCloud: parsed.isCloud },
-      "Testing connection",
-    );
-
-    try {
-      if (parsed.isCloud) {
-        const client = createV3Client(parsed, params.credentials, this.log);
-        await client.myself.getCurrentUser();
-      } else {
-        const client = createV2Client(parsed, params.credentials, this.log);
-        await client.myself.getCurrentUser();
-      }
-      this.log.info("Connection test successful");
-      return { success: true };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      this.log.error(
-        { error: message, ...extractJiraErrorDetails(error) },
-        "Connection test failed",
-      );
-      return { success: false, error: `Connection failed: ${message}` };
-    }
+    return this.runConnectionTest({
+      label: "Jira",
+      probe: async () => {
+        if (parsed.isCloud) {
+          const client = createV3Client(parsed, params.credentials, this.log);
+          await client.myself.getCurrentUser();
+        } else {
+          const client = createV2Client(parsed, params.credentials, this.log);
+          await client.myself.getCurrentUser();
+        }
+      },
+      errorContext: extractJiraErrorDetails,
+    });
   }
 
   async estimateTotalItems(params: {
@@ -544,6 +531,7 @@ function shouldSkipIssue(issue: any, labelsToSkip?: string[]): boolean {
  * Format an ISO 8601 timestamp with timezone offset (e.g. "2026-03-09T11:05:52.774-0400")
  * by extracting the LOCAL date/time components.  Jira JQL interprets date literals in the
  * authenticating user's timezone, so we must use the local time, not UTC.
+ * @public — exported for testability
  */
 export function formatJiraLocalDate(rawTimestamp: string): string {
   const match = rawTimestamp.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
@@ -657,6 +645,7 @@ function formatComment(comment: unknown, isCloud: boolean): string {
 /**
  * Extract plain text from Atlassian Document Format (ADF).
  * ADF is a nested JSON structure used by Jira Cloud v3.
+ * @public — exported for testability
  */
 export function extractTextFromAdf(adf: unknown): string {
   if (adf == null) return "";

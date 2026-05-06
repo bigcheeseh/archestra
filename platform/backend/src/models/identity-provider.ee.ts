@@ -1,6 +1,10 @@
 import type { SSOOptions } from "@better-auth/sso";
 import type { IdentityProviderOidcConfig, IdpRoleMappingConfig } from "@shared";
-import { IDENTITY_TRUSTED_PROVIDER_IDS, MEMBER_ROLE_NAME } from "@shared";
+import {
+  IDENTITY_PROVIDER_ID,
+  IDENTITY_TRUSTED_PROVIDER_IDS,
+  MEMBER_ROLE_NAME,
+} from "@shared";
 import { APIError } from "better-auth";
 import { and, eq } from "drizzle-orm";
 import { jwtDecode } from "jwt-decode";
@@ -571,7 +575,11 @@ class IdentityProviderModel {
     const parsedData = {
       providerId: data.providerId,
       issuer: data.issuer,
-      domain: data.domain,
+      domain:
+        normalizePersistedAllowedEmailDomain({
+          providerId: data.providerId,
+          domain: data.domain,
+        }) || SSO_REGISTRATION_PLACEHOLDER_DOMAIN,
       organizationId,
       ...(data.oidcConfig && {
         oidcConfig:
@@ -635,9 +643,14 @@ class IdentityProviderModel {
     const samlConfigJson = serializeConfigValue(data.samlConfig);
     const roleMappingJson = serializeConfigValue(data.roleMapping);
     const teamSyncConfigJson = serializeConfigValue(data.teamSyncConfig);
+    const persistedDomain = normalizePersistedAllowedEmailDomain({
+      providerId: data.providerId,
+      domain: data.domain,
+    });
     const [updatedProvider] = await db
       .update(schema.identityProvidersTable)
       .set({
+        domain: persistedDomain,
         domainVerified: true,
         ...(oidcConfigJson !== undefined && {
           oidcConfig: oidcConfigJson as unknown as typeof data.oidcConfig,
@@ -700,6 +713,11 @@ class IdentityProviderModel {
     const samlConfigJson = serializeConfigValue(samlConfig);
     const roleMappingJson = serializeConfigValue(roleMapping);
     const teamSyncConfigJson = serializeConfigValue(teamSyncConfig);
+    const nextProviderId = restData.providerId ?? existingProvider.providerId;
+    const nextDomain = normalizePersistedAllowedEmailDomain({
+      providerId: nextProviderId,
+      domain: restData.domain ?? existingProvider.domain,
+    });
 
     // Update in database
     // WORKAROUND: Always ensure domainVerified is true to enable account linking
@@ -708,6 +726,7 @@ class IdentityProviderModel {
       .update(schema.identityProvidersTable)
       .set({
         ...restData,
+        domain: nextDomain,
         domainVerified: true,
         ...(oidcConfigJson !== undefined && {
           oidcConfig: oidcConfigJson as unknown as typeof oidcConfig,
@@ -827,6 +846,7 @@ class IdentityProviderModel {
 export default IdentityProviderModel;
 
 const OIDC_DISCOVERY_TIMEOUT_MS = 10_000;
+const SSO_REGISTRATION_PLACEHOLDER_DOMAIN = "sso-placeholder.example.com";
 
 function serializeConfigValue(
   value: string | object | null | undefined,
@@ -842,6 +862,17 @@ function serializeConfigValue(
   return JSON.stringify(value);
 }
 
+function normalizePersistedAllowedEmailDomain(params: {
+  providerId: string;
+  domain: string;
+}): string {
+  if (params.providerId === IDENTITY_PROVIDER_ID.GOOGLE) {
+    return params.domain;
+  }
+
+  return "";
+}
+
 async function hydrateOidcConfigForRegistration<
   T extends {
     providerId: string;
@@ -855,7 +886,10 @@ async function hydrateOidcConfigForRegistration<
     return data;
   }
 
-  const hydratedOidcConfig = await discoverOidcConfig(data.oidcConfig);
+  const hydratedOidcConfig = await discoverOidcConfig({
+    ...data.oidcConfig,
+    issuer: data.issuer,
+  });
 
   logger.info(
     {
@@ -919,8 +953,11 @@ async function discoverOidcConfig(
       throw new ApiError(400, validationError);
     }
 
+    const discoveredIssuer = discoveryDocument.issuer as string;
+
     return {
       ...oidcConfig,
+      issuer: oidcConfig.issuer.trim() || discoveredIssuer,
       skipDiscovery: true,
       authorizationEndpoint: discoveryDocument.authorization_endpoint,
       tokenEndpoint: discoveryDocument.token_endpoint,
@@ -965,7 +1002,10 @@ function getOidcDiscoveryValidationError(
     return "OIDC discovery document is missing one or more required endpoints.";
   }
 
-  if (normalizeIssuer(document.issuer) !== normalizeIssuer(configuredIssuer)) {
+  if (
+    configuredIssuer.trim().length > 0 &&
+    normalizeIssuer(document.issuer) !== normalizeIssuer(configuredIssuer)
+  ) {
     return `OIDC discovery issuer "${document.issuer}" did not match configured issuer "${configuredIssuer}".`;
   }
 
@@ -1005,12 +1045,19 @@ function assertValidOidcDiscoveryEndpoint(discoveryEndpoint: string): void {
     );
   }
 
-  if (!config.test.enableE2eTestEndpoints && parsedUrl.protocol !== "https:") {
+  const allowLocalDevelopmentDiscovery = !config.production;
+
+  if (
+    !config.test.enableE2eTestEndpoints &&
+    !allowLocalDevelopmentDiscovery &&
+    parsedUrl.protocol !== "https:"
+  ) {
     throw new ApiError(400, "OIDC discovery endpoint must use HTTPS.");
   }
 
   if (
     !config.test.enableE2eTestEndpoints &&
+    !allowLocalDevelopmentDiscovery &&
     isPrivateOrLoopbackHostname(parsedUrl.hostname)
   ) {
     throw new ApiError(

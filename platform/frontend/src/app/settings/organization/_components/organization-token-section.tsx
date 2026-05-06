@@ -23,7 +23,7 @@ export function OrganizationTokenSection() {
       <Card>
         <SettingsCardHeader
           title="Organization Token"
-          description="Organization-wide authentication token for MCP Gateway access"
+          description="Organization-wide authentication token for Agents / MCP Gateways"
         />
         <CardContent>
           {tokensLoading ? (
@@ -58,7 +58,7 @@ export function OrganizationTokenSection() {
                       setTokenDialogOpen(true);
                     }}
                   >
-                    <Key className="mr-2 h-4 w-4" />
+                    <Key className="h-4 w-4" />
                     Manage Token
                   </PermissionButton>
                 </div>

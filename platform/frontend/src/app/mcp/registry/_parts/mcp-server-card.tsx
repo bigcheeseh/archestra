@@ -21,6 +21,7 @@ import { useState } from "react";
 import { toast } from "sonner";
 
 import { McpCatalogIcon } from "@/components/mcp-catalog-icon";
+import { ResourceVisibilityBadge } from "@/components/resource-visibility-badge";
 import {
   Avatar,
   AvatarFallback,
@@ -89,8 +90,10 @@ export type McpServerCardProps = {
   onCancelInstallation?: (serverId: string) => void;
   /** Called when user wants to add a personal connection from manage dialog */
   onAddPersonalConnection?: () => void;
-  /** Called when user wants to add a shared connection for a specific team */
+  /** Called when user wants to add a team connection for a specific team */
   onAddSharedConnection?: (teamId: string) => void;
+  /** Called when user wants to add an organization-wide connection */
+  onAddOrgConnection?: () => void;
   /** When true, renders as a built-in Playwright server (non-editable, personal-only) */
   isBuiltInPlaywright?: boolean;
 };
@@ -117,6 +120,7 @@ export function McpServerCard({
   onCancelInstallation,
   onAddPersonalConnection,
   onAddSharedConnection,
+  onAddOrgConnection,
   isBuiltInPlaywright = false,
 }: McpServerCardBaseProps) {
   const isBuiltin = variant === "builtin";
@@ -285,10 +289,11 @@ export function McpServerCard({
     ? deploymentStatuses[installedServer.id]
     : null;
   const isDeploymentFailed = installedDeploymentStatus?.state === "failed";
+  const installationError =
+    installationStatus === "error"
+      ? (installedServer?.localInstallationError ?? "Installation failed")
+      : null;
 
-  const hasError = installedServer?.localInstallationStatus === "error";
-  const errorMessage =
-    installedServer?.localInstallationError || installedDeploymentStatus?.error;
   const _mcpServersCount = mcpServerOfCurrentCatalogItem?.length ?? 0;
 
   // Check for OAuth refresh errors on any credential the user can see
@@ -320,9 +325,49 @@ export function McpServerCard({
   const deploymentServerIds = (allMcpServers ?? [])
     .filter((s) => s.catalogId === item.id && s.serverType === "local")
     .map((s) => s.id);
+
+  // Multi-tenant catalogs alias one K8s pod across many mcp_server rows.
+  // Each row's K8sDeployment instance reports its own state independently
+  // (one stays "pending" while another flips to "failed"), so before any
+  // summary or per-row dot is computed, canonicalize the state per podName
+  // by picking the highest-priority observation. All rows then agree.
+  const STATE_PRIORITY: Record<string, number> = {
+    failed: 4,
+    running: 3,
+    succeeded: 3,
+    pending: 2,
+    not_created: 1,
+  };
+  const effectiveDeploymentStatuses = (() => {
+    if (!item.multitenant) return deploymentStatuses;
+    const canonicalByPod = new Map<string, string>();
+    for (const id of deploymentServerIds) {
+      const entry = deploymentStatuses[id];
+      if (!entry?.podName) continue;
+      const current = canonicalByPod.get(entry.podName);
+      if (
+        !current ||
+        (STATE_PRIORITY[entry.state] ?? 0) > (STATE_PRIORITY[current] ?? 0)
+      ) {
+        canonicalByPod.set(entry.podName, entry.state);
+      }
+    }
+    if (canonicalByPod.size === 0) return deploymentStatuses;
+    const next: typeof deploymentStatuses = { ...deploymentStatuses };
+    for (const id of deploymentServerIds) {
+      const entry = next[id];
+      if (!entry?.podName) continue;
+      const canonical = canonicalByPod.get(entry.podName);
+      if (canonical && canonical !== entry.state) {
+        next[id] = { ...entry, state: canonical as typeof entry.state };
+      }
+    }
+    return next;
+  })();
+
   const deploymentSummary = computeDeploymentStatusSummary(
     deploymentServerIds,
-    deploymentStatuses,
+    effectiveDeploymentStatuses,
   );
 
   const chatButton =
@@ -334,7 +379,7 @@ export function McpServerCard({
         disabled={isChatCreating}
         onClick={handleChatWithMcpServer}
       >
-        <MessageSquare className="mr-2 h-4 w-4" />
+        <MessageSquare className="h-4 w-4" />
         {isChatCreating ? "Creating..." : "Chat"}
       </Button>
     ) : null;
@@ -358,7 +403,15 @@ export function McpServerCard({
     serverIds: string[];
   }> = [];
   const seenKeys = new Set<string>();
+  const hasOrgConnection = (mcpServerOfCurrentCatalogItem ?? []).some(
+    (server) =>
+      (server.scope ?? (server.teamId ? "team" : "personal")) === "org",
+  );
   for (const server of mcpServerOfCurrentCatalogItem ?? []) {
+    const serverScope = server.scope ?? (server.teamId ? "team" : "personal");
+    if (serverScope === "org") {
+      continue;
+    }
     if (server.teamDetails?.name) {
       const key = `team-${server.teamDetails.teamId}`;
       if (!seenKeys.has(key)) {
@@ -391,13 +444,39 @@ export function McpServerCard({
 
   const toolsCount = tools?.length ?? 0;
 
+  const showAuthorAvatar =
+    item.scope === "personal" && Boolean(item.authorName);
+
   const hasCompactInfoContent =
+    showAuthorAvatar ||
     toolsCount > 0 ||
     (variant === "local" && deploymentServerIds.length > 0) ||
-    (!isBuiltinVariant && connectionAvatars.length > 0);
+    (!isBuiltinVariant && (connectionAvatars.length > 0 || hasOrgConnection));
 
   const compactInfoRow = hasCompactInfoContent ? (
     <div className="flex items-center gap-3 text-sm text-muted-foreground border-t pt-3">
+      {showAuthorAvatar && (
+        <>
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Avatar className="size-6 border-2 border-background">
+                  <AvatarFallback className="text-[10px]">
+                    {item.authorName?.slice(0, 2).toUpperCase()}
+                  </AvatarFallback>
+                </Avatar>
+              </TooltipTrigger>
+              <TooltipContent>Author: {item.authorName}</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+          {(toolsCount > 0 ||
+            (variant === "local" && deploymentServerIds.length > 0) ||
+            (!isBuiltinVariant &&
+              (connectionAvatars.length > 0 || hasOrgConnection))) && (
+            <div className="h-4 w-px bg-border" />
+          )}
+        </>
+      )}
       {toolsCount > 0 && (
         <>
           <div className="flex items-center gap-1">
@@ -431,13 +510,37 @@ export function McpServerCard({
           <div className="h-4 w-px bg-border" />
         </>
       )}
+      {!isBuiltinVariant && hasOrgConnection && (
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={() => openSettingsPage("connections")}
+                className="inline-flex items-center rounded-full"
+              >
+                <ResourceVisibilityBadge
+                  scope="org"
+                  teams={undefined}
+                  authorId={undefined}
+                  authorName={undefined}
+                  currentUserId={undefined}
+                />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>
+              Installed organization-wide. Manage credentials to review.
+            </TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+      )}
       {!isBuiltinVariant && connectionAvatars.length > 0 && (
         <div className="flex items-center gap-2">
           <AvatarGroup>
             {connectionAvatars.slice(0, MAX_AVATARS).map((entry) => {
               const connDeployment = computeDeploymentStatusSummary(
                 entry.serverIds,
-                deploymentStatuses,
+                effectiveDeploymentStatuses,
               );
               const borderClass = connDeployment
                 ? {
@@ -486,7 +589,7 @@ export function McpServerCard({
                     </AvatarFallback>
                   </Avatar>
                 </TooltipTrigger>
-                <TooltipContent>Manage connections</TooltipContent>
+                <TooltipContent>Manage credentials</TooltipContent>
               </Tooltip>
             </TooltipProvider>
           </AvatarGroup>
@@ -510,8 +613,6 @@ export function McpServerCard({
     </div>
   ) : null;
 
-  const shouldShowErrorBanner = hasError || isDeploymentFailed;
-
   const remoteCardContent = (
     <>
       <div className="flex flex-wrap gap-2">
@@ -524,8 +625,8 @@ export function McpServerCard({
             variant="outline"
             className="flex-1 text-destructive border-destructive/30 hover:bg-destructive/10"
           >
-            <RefreshCw className="mr-2 h-4 w-4" />
-            Reconnect
+            <RefreshCw className="h-4 w-4" />
+            Reinstall
           </PermissionButton>
         )}
         {!isInstalling &&
@@ -543,7 +644,7 @@ export function McpServerCard({
                 }
               }}
             >
-              Disconnect
+              Uninstall
             </Button>
           ) : (
             <PermissionButton
@@ -553,8 +654,8 @@ export function McpServerCard({
               variant="outline"
               className="flex-1"
             >
-              <User className="mr-2 h-4 w-4" />
-              Connect
+              <User className="h-4 w-4" />
+              Install
             </PermissionButton>
           ))}
       </div>
@@ -573,7 +674,7 @@ export function McpServerCard({
             variant="outline"
             className="flex-1 text-destructive border-destructive/30 hover:bg-destructive/10"
           >
-            <RefreshCw className="mr-2 h-4 w-4" />
+            <RefreshCw className="h-4 w-4" />
             Reinstall
           </PermissionButton>
         )}
@@ -608,7 +709,7 @@ export function McpServerCard({
                       className="w-full"
                       data-testid={`${E2eTestId.ConnectCatalogItemButton}-${item.name}`}
                     >
-                      <Server className="mr-2 h-4 w-4" />
+                      <Server className="h-4 w-4" />
                       Install
                     </PermissionButton>
                   </div>
@@ -637,7 +738,7 @@ export function McpServerCard({
             variant="outline"
             className="flex-1 text-destructive border-destructive/30 hover:bg-destructive/10"
           >
-            <RefreshCw className="mr-2 h-4 w-4" />
+            <RefreshCw className="h-4 w-4" />
             Reinstall
           </PermissionButton>
         )}
@@ -672,7 +773,7 @@ export function McpServerCard({
                       className="w-full"
                       data-testid={`${E2eTestId.ConnectCatalogItemButton}-${item.name}`}
                     >
-                      <Server className="mr-2 h-4 w-4" />
+                      <Server className="h-4 w-4" />
                       Install
                     </PermissionButton>
                   </div>
@@ -716,6 +817,7 @@ export function McpServerCard({
         showYaml={variant === "local"}
         onAddPersonalConnection={onAddPersonalConnection}
         onAddSharedConnection={onAddSharedConnection}
+        onAddOrgConnection={onAddOrgConnection}
         installs={allInstalls}
         deploymentStatuses={deploymentStatuses}
         deploymentServerIds={deploymentServerIds}
@@ -769,57 +871,69 @@ export function McpServerCard({
         </div>
       </CardHeader>
       <CardContent className="flex flex-col gap-4 flex-grow">
-        {variant === "local" && (isInstalling || shouldShowErrorBanner) && (
-          <div className="bg-muted/50 rounded-md overflow-hidden">
-            {isInstalling ? (
-              <div className="px-3 py-2">
-                <InstallationProgress
-                  status={
-                    installationStatus === "error"
-                      ? null
-                      : (installationStatus ?? null)
-                  }
-                  serverId={installedServer?.id}
-                  deploymentStatuses={deploymentStatuses}
-                  onMoreDetails={() => {
+        {variant === "local" && installationError && installedServer && (
+          <div
+            className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+            data-testid={`${E2eTestId.McpServerError}-${item.name}`}
+          >
+            <div className="flex items-start gap-2">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              <div className="min-w-0 flex-1">
+                <p className="font-medium">Installation failed</p>
+                <p className="truncate text-xs" title={installationError}>
+                  {installationError}
+                </p>
+              </div>
+              <div className="flex shrink-0 flex-col items-end gap-1">
+                <Button
+                  variant="link"
+                  size="sm"
+                  className="h-auto p-0 text-destructive"
+                  data-testid={`${E2eTestId.McpLogsViewButton}-${item.name}`}
+                  onClick={() => {
                     setSettingsInitialPage("debug-logs");
-                    if (installedServer?.id) {
-                      setLogsInitialServerId(installedServer.id);
-                    }
+                    setLogsInitialServerId(installedServer.id);
                     setSettingsDialogOpen(true);
                   }}
-                />
-              </div>
-            ) : isCurrentUserAuthenticated &&
-              shouldShowErrorBanner &&
-              errorMessage ? (
-              <div className="flex items-center justify-between px-3 py-2 text-sm">
-                <span
-                  className="text-destructive"
-                  data-testid={`${E2eTestId.McpServerError}-${item.name}`}
                 >
-                  Failed to start MCP server,{" "}
-                  <button
-                    type="button"
-                    onClick={() => openSettingsPage("debug-logs")}
-                    className="text-primary hover:underline cursor-pointer"
-                    data-testid={`${E2eTestId.McpLogsViewButton}-${item.name}`}
-                  >
-                    view the logs
-                  </button>{" "}
-                  or{" "}
-                  <button
-                    type="button"
-                    onClick={() => openSettingsPage("configuration")}
-                    className="text-primary hover:underline cursor-pointer"
-                    data-testid={`${E2eTestId.McpLogsEditConfigButton}-${item.name}`}
-                  >
-                    edit your config
-                  </button>
-                  .
-                </span>
+                  View logs
+                </Button>
+                <Button
+                  variant="link"
+                  size="sm"
+                  className="h-auto p-0 text-destructive"
+                  data-testid={`${E2eTestId.McpLogsEditConfigButton}-${item.name}`}
+                  onClick={() => {
+                    setSettingsInitialPage("configuration");
+                    setSettingsDialogOpen(true);
+                  }}
+                >
+                  Edit config
+                </Button>
               </div>
-            ) : null}
+            </div>
+          </div>
+        )}
+        {variant === "local" && isInstalling && (
+          <div className="bg-muted/50 rounded-md overflow-hidden">
+            <div className="px-3 py-2">
+              <InstallationProgress
+                status={
+                  installationStatus === "error"
+                    ? null
+                    : (installationStatus ?? null)
+                }
+                serverId={installedServer?.id}
+                deploymentStatuses={deploymentStatuses}
+                onMoreDetails={() => {
+                  setSettingsInitialPage("debug-logs");
+                  if (installedServer?.id) {
+                    setLogsInitialServerId(installedServer.id);
+                  }
+                  setSettingsDialogOpen(true);
+                }}
+              />
+            </div>
           </div>
         )}
         <div className="mt-auto flex flex-col gap-4">

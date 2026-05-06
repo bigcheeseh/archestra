@@ -9,6 +9,7 @@
  *
  * @see https://docs.mistral.ai/api
  */
+import { ArchestraInternalErrorCode } from "@shared";
 import { get } from "lodash-es";
 import OpenAIProvider from "openai";
 import type {
@@ -240,6 +241,7 @@ export const mistralAdapterFactory: LLMProvider<
       apiKey,
       baseURL: options.baseUrl ?? config.llm.mistral.baseUrl,
       fetch: customFetch,
+      defaultHeaders: options.defaultHeaders,
     });
   },
 
@@ -277,6 +279,13 @@ export const mistralAdapterFactory: LLMProvider<
         }
       },
     };
+  },
+
+  extractInternalCode(error: unknown): ArchestraInternalErrorCode | undefined {
+    if (get(error, "error.code") === "context_length_exceeded") {
+      return ArchestraInternalErrorCode.ContextLengthExceeded;
+    }
+    return undefined;
   },
 
   extractErrorMessage(error: unknown): string {

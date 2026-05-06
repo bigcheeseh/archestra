@@ -83,6 +83,10 @@ import {
   MCP_GATEWAY_PREFIX,
   READY_PATH,
 } from "./routes/route-paths";
+import {
+  UserConfigFieldDefaultSchema,
+  UserConfigFieldSchema,
+} from "./types/mcp-catalog";
 
 /** Max time to wait for cleanup operations during graceful shutdown before exiting */
 const SHUTDOWN_CLEANUP_TIMEOUT_MS = 3000;
@@ -203,6 +207,12 @@ export function registerOpenApiSchemas() {
   z.globalRegistry.add(Xai.API.ChatCompletionResponseSchema, {
     id: "XaiChatCompletionResponse",
   });
+  z.globalRegistry.add(UserConfigFieldDefaultSchema, {
+    id: "UserConfigFieldDefault",
+  });
+  z.globalRegistry.add(UserConfigFieldSchema, {
+    id: "UserConfigField",
+  });
 }
 
 // Register schemas at module load time
@@ -258,11 +268,13 @@ export async function registerWorkerRoutes(fastify: FastifyInstanceWithZod) {
   fastify.register(routes.geminiProxyRoutes);
   fastify.register(routes.azureProxyRoutes);
   fastify.register(routes.bedrockProxyRoutes);
+  fastify.register(routes.bedrockOpenaiProxyRoutes);
   fastify.register(routes.cerebrasProxyRoutes);
   fastify.register(routes.cohereProxyRoutes);
   fastify.register(routes.deepseekProxyRoutes);
   fastify.register(routes.groqProxyRoutes);
   fastify.register(routes.minimaxProxyRoutes);
+  fastify.register(routes.modelRouterProxyRoutes);
   fastify.register(routes.mistralProxyRoutes);
   fastify.register(routes.ollamaProxyRoutes);
   fastify.register(routes.openrouterProxyRoutes);
@@ -282,6 +294,7 @@ export const createFastifyInstance = () =>
     loggerInstance: logger,
     disableRequestLogging: true,
     trustProxy: config.api.trustProxy,
+    bodyLimit: config.api.bodyLimit,
   })
     .withTypeProvider<ZodTypeProvider>()
     .setValidatorCompiler(validatorCompiler)
@@ -345,7 +358,7 @@ export const createFastifyInstance = () =>
 
       // Handle ApiError objects
       if (error instanceof ApiError) {
-        const { statusCode, message, type } = error;
+        const { statusCode, message, type, internalCode } = error;
 
         if (statusCode >= 500) {
           this.log.error(
@@ -368,6 +381,7 @@ export const createFastifyInstance = () =>
           error: {
             message,
             type,
+            ...(internalCode && { internal_code: internalCode }),
           },
         });
       }

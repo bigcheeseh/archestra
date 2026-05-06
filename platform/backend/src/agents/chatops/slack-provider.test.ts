@@ -1,5 +1,5 @@
 import { createHmac } from "node:crypto";
-import { SLACK_REQUIRED_BOT_SCOPES } from "@shared";
+import { SLACK_REQUIRED_BOT_SCOPES, SLACK_SLASH_COMMANDS } from "@shared";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { CacheKey, cacheManager } from "@/cache-manager";
 import SlackProvider from "./slack-provider";
@@ -436,6 +436,103 @@ describe("SlackProvider.parseWebhookNotification", () => {
     expect(result).not.toBeNull();
     expect(result?.senderId).toBe("unknown");
     expect(result?.senderName).toBe("Unknown User");
+  });
+});
+
+// =============================================================================
+// sendReply
+// =============================================================================
+
+describe("SlackProvider.sendReply", () => {
+  test("sends native markdown blocks and includes footer in fallback text", async () => {
+    const provider = createProvider();
+    const postMessage = vi.fn().mockResolvedValue({ ts: "2222222222.000000" });
+    // biome-ignore lint/suspicious/noExplicitAny: test-only — mock Slack client
+    (provider as any).client = {
+      chat: { postMessage },
+    };
+
+    const result = await provider.sendReply({
+      originalMessage: {
+        messageId: "1234567890.123456",
+        channelId: "C12345",
+        workspaceId: "T12345",
+        threadId: "1111111111.000000",
+        senderId: "U_SENDER",
+        senderName: "Test User",
+        text: "hello",
+        rawText: "hello",
+        timestamp: new Date(),
+        isThreadReply: false,
+      },
+      text: "# Heading\n\n- [x] Done\n| A | B |",
+      footer: "Footer text",
+    });
+
+    expect(result).toBe("2222222222.000000");
+    expect(postMessage).toHaveBeenCalledWith({
+      channel: "C12345",
+      text: "# Heading\n\n- [x] Done\n| A | B |\n\nFooter text",
+      blocks: [
+        {
+          type: "markdown",
+          text: "# Heading\n\n- [x] Done\n| A | B |",
+        },
+        {
+          type: "context",
+          elements: [
+            {
+              type: "plain_text",
+              text: "Footer text",
+              emoji: true,
+            },
+          ],
+        },
+      ],
+      thread_ts: "1111111111.000000",
+    });
+  });
+});
+
+// =============================================================================
+// sendAgentSelectionCard
+// =============================================================================
+
+describe("SlackProvider.sendAgentSelectionCard", () => {
+  test("uses shared Slack command names in the welcome card", async () => {
+    const provider = createProvider();
+    const postEphemeral = vi.fn().mockResolvedValue({ ok: true });
+    // biome-ignore lint/suspicious/noExplicitAny: test-only — mock Slack client
+    (provider as any).client = {
+      chat: { postEphemeral },
+    };
+
+    await provider.sendAgentSelectionCard({
+      message: {
+        messageId: "1234567890.123456",
+        channelId: "C12345",
+        workspaceId: "T12345",
+        senderId: "U_SENDER",
+        senderName: "Test User",
+        text: "hello",
+        rawText: "hello",
+        timestamp: new Date(),
+        isThreadReply: false,
+      },
+      agents: [{ id: "agent-1", name: "Sales" }],
+      isWelcome: true,
+    });
+
+    const callArgs = postEphemeral.mock.calls[0][0];
+    expect(JSON.stringify(callArgs.blocks)).toContain(
+      SLACK_SLASH_COMMANDS.SELECT_AGENT,
+    );
+    expect(JSON.stringify(callArgs.blocks)).toContain(
+      SLACK_SLASH_COMMANDS.STATUS,
+    );
+    expect(JSON.stringify(callArgs.blocks)).toContain(
+      SLACK_SLASH_COMMANDS.HELP,
+    );
   });
 });
 

@@ -6,6 +6,8 @@ import {
 } from "@shared";
 import { vi } from "vitest";
 import {
+  ChatOpsChannelBindingModel,
+  ChatOpsThreadAgentOverrideModel,
   ConversationModel,
   LlmProviderApiKeyModel,
   OrganizationModel,
@@ -244,7 +246,149 @@ describe("chat tool execution", () => {
     expect(updatedConversation?.chatApiKeyId).toBe(targetApiKey.id);
   });
 
-  test("swap_agent returns error when swapping to same agent", async ({
+  test("swap_agent succeeds with chatops binding context", async ({
+    makeAgent,
+  }) => {
+    const targetAgent = await makeAgent({
+      name: "ChatOps Swap Target",
+      agentType: "agent",
+      organizationId,
+    });
+
+    const binding = await ChatOpsChannelBindingModel.create({
+      organizationId,
+      provider: "slack",
+      channelId: "C-chatops-swap",
+      workspaceId: "W-chatops-swap",
+      agentId: testAgent.id,
+    });
+
+    const contextWithChatOpsBinding: ArchestraContext = {
+      ...mockContext,
+      chatOpsBindingId: binding.id,
+      chatOpsThreadId: "thread-1234",
+    };
+
+    const result = await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}swap_agent`,
+      { agent_name: "ChatOps Swap Target" },
+      contextWithChatOpsBinding,
+    );
+
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toEqual({
+      success: true,
+      agent_id: targetAgent.id,
+      agent_name: "ChatOps Swap Target",
+    });
+
+    // Thread override should be created
+    const override = await ChatOpsThreadAgentOverrideModel.findByThread(
+      binding.id,
+      "thread-1234",
+    );
+    expect(override?.agentId).toBe(targetAgent.id);
+
+    // Channel binding should NOT be mutated
+    const updatedBinding = await ChatOpsChannelBindingModel.findById(
+      binding.id,
+    );
+    expect(updatedBinding?.agentId).toBe(testAgent.id);
+  });
+
+  test("swap_agent cannot assign personal agent to shared chatops channel", async ({
+    makeAgent,
+  }) => {
+    const personalAgent = await makeAgent({
+      name: "Personal ChatOps Target",
+      agentType: "agent",
+      organizationId,
+      scope: "personal",
+      authorId: userId,
+    });
+
+    const binding = await ChatOpsChannelBindingModel.create({
+      organizationId,
+      provider: "slack",
+      channelId: "C-chatops-personal-blocked",
+      workspaceId: "W-chatops-personal-blocked",
+      agentId: testAgent.id,
+      isDm: false,
+    });
+
+    const result = await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}swap_agent`,
+      { agent_name: personalAgent.name },
+      {
+        ...mockContext,
+        chatOpsBindingId: binding.id,
+        chatOpsThreadId: "thread-personal-blocked",
+      },
+    );
+
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as any).text).toContain(
+      "Personal agents cannot be assigned to channels",
+    );
+
+    const updatedBinding = await ChatOpsChannelBindingModel.findById(
+      binding.id,
+    );
+    expect(updatedBinding?.agentId).toBe(testAgent.id);
+  });
+
+  test("swap_agent prefers chatops binding when both contexts are present", async ({
+    makeAgent,
+  }) => {
+    const targetAgent = await makeAgent({
+      name: "ChatOps Preferred Target",
+      agentType: "agent",
+      organizationId,
+    });
+
+    const binding = await ChatOpsChannelBindingModel.create({
+      organizationId,
+      provider: "slack",
+      channelId: "C-chatops-both-contexts",
+      workspaceId: "W-chatops-both-contexts",
+      agentId: testAgent.id,
+    });
+
+    const contextWithBoth: ArchestraContext = {
+      ...mockContext,
+      conversationId: "synthetic-chatops-isolation-key",
+      chatOpsBindingId: binding.id,
+      chatOpsThreadId: "thread-both-contexts",
+    };
+
+    const result = await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}swap_agent`,
+      { agent_name: "ChatOps Preferred Target" },
+      contextWithBoth,
+    );
+
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toEqual({
+      success: true,
+      agent_id: targetAgent.id,
+      agent_name: "ChatOps Preferred Target",
+    });
+
+    // Thread override should be created (chatops binding path was taken)
+    const override = await ChatOpsThreadAgentOverrideModel.findByThread(
+      binding.id,
+      "thread-both-contexts",
+    );
+    expect(override?.agentId).toBe(targetAgent.id);
+
+    // Channel binding should NOT be mutated
+    const updatedBinding = await ChatOpsChannelBindingModel.findById(
+      binding.id,
+    );
+    expect(updatedBinding?.agentId).toBe(testAgent.id);
+  });
+
+  test("swap_agent returns structured state when swapping to same agent", async ({
     makeConversation,
   }) => {
     const conversation = await makeConversation(testAgent.id, {
@@ -262,7 +406,16 @@ describe("chat tool execution", () => {
       { agent_name: testAgent.name },
       contextWithConvo,
     );
-    expect(result.isError).toBe(true);
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      success: false,
+      code: "already_using_agent",
+      archestraError: {
+        type: "tool_state",
+        code: "already_using_agent",
+        toolName: "swap_agent",
+      },
+    });
     expect((result.content[0] as any).text).toContain("Already using agent");
   });
 
@@ -278,7 +431,7 @@ describe("chat tool execution", () => {
     );
   });
 
-  test("swap_to_default_agent returns error when no default agent configured", async ({
+  test("swap_to_default_agent returns structured state when no default agent configured", async ({
     makeConversation,
   }) => {
     const conversation = await makeConversation(testAgent.id, {
@@ -296,7 +449,16 @@ describe("chat tool execution", () => {
       {},
       contextWithConvo,
     );
-    expect(result.isError).toBe(true);
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      success: false,
+      code: "no_default_agent",
+      archestraError: {
+        type: "tool_state",
+        code: "no_default_agent",
+        toolName: "swap_to_default_agent",
+      },
+    });
     expect((result.content[0] as any).text).toContain(
       "No default agent is configured",
     );
@@ -379,6 +541,157 @@ describe("chat tool execution", () => {
     expect(updatedConversation?.chatApiKeyId).toBe(defaultApiKey.id);
   });
 
+  test("swap_to_default_agent succeeds with chatops binding context", async ({
+    makeAgent,
+  }) => {
+    const defaultAgent = await makeAgent({
+      name: "ChatOps Default Agent",
+      agentType: "agent",
+      organizationId,
+    });
+    await OrganizationModel.patch(organizationId, {
+      defaultAgentId: defaultAgent.id,
+    });
+
+    const binding = await ChatOpsChannelBindingModel.create({
+      organizationId,
+      provider: "ms-teams",
+      channelId: "CH-chatops-default",
+      workspaceId: "WS-chatops-default",
+      agentId: testAgent.id,
+    });
+
+    const contextWithChatOpsBinding: ArchestraContext = {
+      ...mockContext,
+      chatOpsBindingId: binding.id,
+      chatOpsThreadId: "thread-default-swap",
+    };
+
+    const result = await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}swap_to_default_agent`,
+      {},
+      contextWithChatOpsBinding,
+    );
+
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toEqual({
+      success: true,
+      agent_id: defaultAgent.id,
+      agent_name: "ChatOps Default Agent",
+    });
+
+    // Thread override should be created
+    const override = await ChatOpsThreadAgentOverrideModel.findByThread(
+      binding.id,
+      "thread-default-swap",
+    );
+    expect(override?.agentId).toBe(defaultAgent.id);
+
+    // Channel binding should NOT be mutated
+    const updatedBinding = await ChatOpsChannelBindingModel.findById(
+      binding.id,
+    );
+    expect(updatedBinding?.agentId).toBe(testAgent.id);
+  });
+
+  test("swap_to_default_agent cannot assign personal default agent to shared chatops channel", async ({
+    makeAgent,
+  }) => {
+    const defaultAgent = await makeAgent({
+      name: "Personal Default Agent",
+      agentType: "agent",
+      organizationId,
+      scope: "personal",
+      authorId: userId,
+    });
+    await OrganizationModel.patch(organizationId, {
+      defaultAgentId: defaultAgent.id,
+    });
+
+    const binding = await ChatOpsChannelBindingModel.create({
+      organizationId,
+      provider: "ms-teams",
+      channelId: "CH-chatops-personal-default-blocked",
+      workspaceId: "WS-chatops-personal-default-blocked",
+      agentId: testAgent.id,
+      isDm: false,
+    });
+
+    const result = await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}swap_to_default_agent`,
+      {},
+      {
+        ...mockContext,
+        chatOpsBindingId: binding.id,
+        chatOpsThreadId: "thread-personal-default-blocked",
+      },
+    );
+
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as any).text).toContain(
+      "Personal agents cannot be assigned to channels",
+    );
+
+    const updatedBinding = await ChatOpsChannelBindingModel.findById(
+      binding.id,
+    );
+    expect(updatedBinding?.agentId).toBe(testAgent.id);
+  });
+
+  test("swap_to_default_agent prefers chatops binding when both contexts are present", async ({
+    makeAgent,
+  }) => {
+    const defaultAgent = await makeAgent({
+      name: "ChatOps Preferred Default",
+      agentType: "agent",
+      organizationId,
+    });
+    await OrganizationModel.patch(organizationId, {
+      defaultAgentId: defaultAgent.id,
+    });
+
+    const binding = await ChatOpsChannelBindingModel.create({
+      organizationId,
+      provider: "ms-teams",
+      channelId: "CH-chatops-both-contexts",
+      workspaceId: "WS-chatops-both-contexts",
+      agentId: testAgent.id,
+    });
+
+    const contextWithBoth: ArchestraContext = {
+      ...mockContext,
+      conversationId: "synthetic-chatops-isolation-key",
+      chatOpsBindingId: binding.id,
+      chatOpsThreadId: "thread-both-default",
+    };
+
+    const result = await executeArchestraTool(
+      `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}swap_to_default_agent`,
+      {},
+      contextWithBoth,
+    );
+
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toEqual({
+      success: true,
+      agent_id: defaultAgent.id,
+      agent_name: "ChatOps Preferred Default",
+    });
+
+    // Thread override should be created (chatops binding path was taken)
+    const override = await ChatOpsThreadAgentOverrideModel.findByThread(
+      binding.id,
+      "thread-both-default",
+    );
+    expect(override?.agentId).toBe(defaultAgent.id);
+
+    // Channel binding should NOT be mutated
+    const updatedBinding = await ChatOpsChannelBindingModel.findById(
+      binding.id,
+    );
+    expect(updatedBinding?.agentId).toBe(testAgent.id);
+  });
+
   test("swap_agent cannot swap to inaccessible team-scoped agent", async ({
     makeAgent,
     makeConversation,
@@ -448,11 +761,20 @@ describe("chat tool execution", () => {
       { agent_name: "Inaccessible Agent" },
       memberContext,
     );
-    expect(result.isError).toBe(true);
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      success: false,
+      code: "no_agent_found",
+      archestraError: {
+        type: "tool_state",
+        code: "no_agent_found",
+        toolName: "swap_agent",
+      },
+    });
     expect((result.content[0] as any).text).toContain("No agent found");
   });
 
-  test("swap_to_default_agent returns error when already on default agent", async ({
+  test("swap_to_default_agent returns structured state when already on default agent", async ({
     makeConversation,
   }) => {
     await OrganizationModel.patch(organizationId, {
@@ -474,7 +796,16 @@ describe("chat tool execution", () => {
       {},
       contextWithConvo,
     );
-    expect(result.isError).toBe(true);
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      success: false,
+      code: "already_using_default_agent",
+      archestraError: {
+        type: "tool_state",
+        code: "already_using_default_agent",
+        toolName: "swap_to_default_agent",
+      },
+    });
     expect((result.content[0] as any).text).toContain(
       "Already using the default agent",
     );

@@ -57,7 +57,7 @@ import type {
 } from "@/types";
 
 type MakeUserOverrides = Partial<
-  Pick<InsertUser, "email" | "name" | "emailVerified">
+  Pick<InsertUser, "email" | "name" | "emailVerified" | "role">
 >;
 
 /**
@@ -453,7 +453,7 @@ async function makeMember(
  */
 async function makeMcpServer(
   overrides: Partial<
-    Pick<InsertMcpServer, "name" | "catalogId" | "ownerId" | "teamId">
+    Pick<InsertMcpServer, "name" | "catalogId" | "ownerId" | "teamId" | "scope">
   > = {},
 ) {
   // Create a catalog if catalogId is not provided
@@ -819,7 +819,7 @@ async function makeIdentityProvider(
       providerId,
       issuer:
         overrides.issuer ?? `https://issuer-${id.substring(0, 8)}.example.com`,
-      domain: overrides.domain ?? `domain-${id.substring(0, 8)}.example.com`,
+      domain: overrides.domain ?? "example.com",
       organizationId,
       oidcConfig: overrides.oidcConfig
         ? (JSON.stringify(overrides.oidcConfig) as unknown as undefined)

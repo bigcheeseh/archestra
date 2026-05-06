@@ -3,6 +3,7 @@ export const RouteId = {
   GetAgents: "getAgents",
   GetAllAgents: "getAllAgents",
   CreateAgent: "createAgent",
+  CloneAgent: "cloneAgent",
   GetAgent: "getAgent",
   GetDefaultMcpGateway: "getDefaultMcpGateway",
   GetDefaultLlmProxy: "getDefaultLlmProxy",
@@ -161,6 +162,18 @@ export const RouteId = {
   OpenAiChatCompletionsWithDefaultAgent:
     "openAiChatCompletionsWithDefaultAgent",
   OpenAiChatCompletionsWithAgent: "openAiChatCompletionsWithAgent",
+  OpenAiResponsesWithDefaultAgent: "openAiResponsesWithDefaultAgent",
+  OpenAiResponsesWithAgent: "openAiResponsesWithAgent",
+
+  // Proxy Routes - OpenAI-compatible model router
+  ModelRouterChatCompletionsWithDefaultAgent:
+    "modelRouterChatCompletionsWithDefaultAgent",
+  ModelRouterChatCompletionsWithAgent: "modelRouterChatCompletionsWithAgent",
+  ModelRouterListModelsWithDefaultAgent:
+    "modelRouterListModelsWithDefaultAgent",
+  ModelRouterListModelsWithAgent: "modelRouterListModelsWithAgent",
+  ModelRouterResponsesWithDefaultAgent: "modelRouterResponsesWithDefaultAgent",
+  ModelRouterResponsesWithAgent: "modelRouterResponsesWithAgent",
 
   // Proxy Routes - Anthropic
   AnthropicMessagesWithDefaultAgent: "anthropicMessagesWithDefaultAgent",
@@ -225,6 +238,14 @@ export const RouteId = {
   BedrockConverseWithAgentAndModel: "bedrockConverseWithAgentAndModel",
   BedrockConverseStreamWithAgentAndModel:
     "bedrockConverseStreamWithAgentAndModel",
+  // OpenAI-compatible routes (translate OpenAI chat/completions ↔ Converse)
+  BedrockOpenaiChatCompletionsWithDefaultAgent:
+    "bedrockOpenaiChatCompletionsWithDefaultAgent",
+  BedrockOpenaiChatCompletionsWithAgent:
+    "bedrockOpenaiChatCompletionsWithAgent",
+  BedrockOpenaiListModelsWithDefaultAgent:
+    "bedrockOpenaiListModelsWithDefaultAgent",
+  BedrockOpenaiListModelsWithAgent: "bedrockOpenaiListModelsWithAgent",
 
   // Proxy Routes - MiniMax
   MinimaxChatCompletionsWithDefaultAgent:
@@ -275,11 +296,17 @@ export const RouteId = {
   DeleteApiKey: "deleteApiKey",
 
   // Virtual API Key Routes
-  GetVirtualApiKeys: "getVirtualApiKeys",
   GetAllVirtualApiKeys: "getAllVirtualApiKeys",
   CreateVirtualApiKey: "createVirtualApiKey",
   UpdateVirtualApiKey: "updateVirtualApiKey",
   DeleteVirtualApiKey: "deleteVirtualApiKey",
+
+  // LLM OAuth Client Routes
+  GetLlmOauthClients: "getLlmOauthClients",
+  CreateLlmOauthClient: "createLlmOauthClient",
+  UpdateLlmOauthClient: "updateLlmOauthClient",
+  RotateLlmOauthClientSecret: "rotateLlmOauthClientSecret",
+  DeleteLlmOauthClient: "deleteLlmOauthClient",
 
   // Models with API Keys Routes
   GetModelsWithApiKeys: "getModelsWithApiKeys",
@@ -314,8 +341,11 @@ export const RouteId = {
   // Agent Settings Routes (organization-level)
   UpdateAgentSettings: "updateAgentSettings",
 
-  // MCP Settings Routes (organization-level)
-  UpdateMcpSettings: "updateMcpSettings",
+  // Auth Settings Routes (organization-level)
+  UpdateAuthSettings: "updateAuthSettings",
+
+  // Connection Settings Routes (organization-level)
+  UpdateConnectionSettings: "updateConnectionSettings",
 
   // Knowledge Settings Routes (organization-level)
   UpdateKnowledgeSettings: "updateKnowledgeSettings",
@@ -336,6 +366,7 @@ export const RouteId = {
 
   // User Routes
   GetUserPermissions: "getUserPermissions",
+  GetImpersonableUsers: "getImpersonableUsers",
 
   // Team Token Routes
   GetTokens: "getTokens",
@@ -409,6 +440,12 @@ export const RouteId = {
   // Connector Run Routes
   GetConnectorRuns: "getConnectorRuns",
   GetConnectorRun: "getConnectorRun",
+
+  // Connector File Upload Routes
+  UploadConnectorFiles: "uploadConnectorFiles",
+  GetConnectorFiles: "getConnectorFiles",
+  GetConnectorFile: "getConnectorFile",
+  DeleteConnectorFile: "deleteConnectorFile",
 
   // Invitation Routes
   CheckInvitation: "checkInvitation",

@@ -21,14 +21,18 @@ import {
   AgentToolModel,
   InternalMcpCatalogModel,
   McpServerModel,
+  TeamModel,
   ToolModel,
 } from "@/models";
 import {
   InsertInternalMcpCatalogSchema,
   type InternalMcpCatalog,
   PartialUpdateInternalMcpCatalogSchema,
+  type ResourceVisibilityScope,
+  ResourceVisibilityScopeSchema,
   UuidIdSchema,
 } from "@/types";
+import { broadcastMcpInstallationStatus } from "@/websocket";
 import {
   catchError,
   deduplicateLabels,
@@ -347,8 +351,11 @@ const DeployMcpServerToolArgsSchema = z
     catalogId: UuidIdSchema.describe(
       "The catalog ID of the MCP server to deploy.",
     ),
+    scope: ResourceVisibilityScopeSchema.optional().describe(
+      "Visibility scope for the deployment: 'personal' (default), 'team' (requires teamId), or 'org' (admins only, visible to all org members).",
+    ),
     teamId: UuidIdSchema.optional().describe(
-      "Optional team ID for a team-scoped deployment.",
+      "Optional team ID for a team-scoped deployment (required when scope='team').",
     ),
     agentIds: z
       .array(UuidIdSchema)
@@ -462,9 +469,6 @@ const registry = defineArchestraTools([
   }),
 ] as const);
 
-export const toolShortNames = registry.toolShortNames;
-export const toolArgsSchemas = registry.toolArgsSchemas;
-export const toolOutputSchemas = registry.toolOutputSchemas;
 export const toolEntries = registry.toolEntries;
 
 // === Exports ===
@@ -977,13 +981,26 @@ async function handleDeployMcpServer(
       );
     }
 
-    const teamId = args.teamId;
+    const scope = args.scope ?? "personal";
+    const teamId = args.teamId ?? null;
+
+    const authError = await authorizeDeployScope({
+      scope,
+      teamId,
+      userId: context.userId,
+      organizationId,
+    });
+    if (authError) {
+      return errorResult(authError);
+    }
+
     const existingServers = await McpServerModel.findByCatalogId(
       args.catalogId,
     );
-    if (!teamId) {
+    if (scope === "personal") {
       const existingPersonal = existingServers.find(
-        (server) => server.ownerId === context.userId && !server.teamId,
+        (server) =>
+          server.scope === "personal" && server.ownerId === context.userId,
       );
       if (existingPersonal) {
         return successResult(
@@ -996,13 +1013,22 @@ async function handleDeployMcpServer(
           ].join("\n"),
         );
       }
-    } else {
+    } else if (scope === "team") {
       const existingTeam = existingServers.find(
-        (server) => server.teamId === teamId,
+        (server) => server.scope === "team" && server.teamId === teamId,
       );
       if (existingTeam) {
         return errorResult(
           "This team already has an installation of this MCP server.",
+        );
+      }
+    } else if (scope === "org") {
+      const existingOrg = existingServers.find(
+        (server) => server.scope === "org",
+      );
+      if (existingOrg) {
+        return errorResult(
+          "This organization already has an installation of this MCP server.",
         );
       }
     }
@@ -1013,6 +1039,7 @@ async function handleDeployMcpServer(
       serverType: catalogItem.serverType,
       ownerId: context.userId,
       userId: context.userId,
+      scope,
       ...(teamId && { teamId }),
     });
 
@@ -1032,6 +1059,7 @@ async function handleDeployMcpServer(
         localInstallationStatus: "pending",
         localInstallationError: null,
       });
+      broadcastMcpInstallationStatus(mcpServer.id, "pending", null);
       await McpServerRuntimeManager.startServer(mcpServer);
 
       void discoverLocalMcpServerTools({
@@ -1096,6 +1124,7 @@ async function handleListMcpServerDeployments(
       lines.push(`- ${server.name}`);
       lines.push(`  ID: ${server.id}`);
       lines.push(`  Type: ${server.serverType}`);
+      lines.push(`  Scope: ${server.scope}`);
       lines.push(`  Catalog: ${server.catalogName || "custom"}`);
       if (server.catalogId) lines.push(`  Catalog ID: ${server.catalogId}`);
       lines.push(`  Status: ${server.localInstallationStatus}`);
@@ -1213,6 +1242,7 @@ async function discoverLocalMcpServerTools(params: {
       localInstallationStatus: "discovering-tools",
       localInstallationError: null,
     });
+    broadcastMcpInstallationStatus(mcpServer.id, "discovering-tools", null);
 
     const discoveredTools = await McpServerModel.getToolsFromServer(mcpServer);
     const toolsToCreate = discoveredTools.map((tool) => ({
@@ -1239,16 +1269,18 @@ async function discoverLocalMcpServerTools(params: {
       localInstallationStatus: "success",
       localInstallationError: null,
     });
+    broadcastMcpInstallationStatus(mcpServer.id, "success", null);
   } catch (err) {
     logger.error(
       { err, mcpServerId: mcpServer.id },
       "Error during async tool discovery after deploy",
     );
+    const errorMessage = err instanceof Error ? err.message : "Unknown error";
     await McpServerModel.update(mcpServer.id, {
       localInstallationStatus: "error",
-      localInstallationError:
-        err instanceof Error ? err.message : "Unknown error",
+      localInstallationError: errorMessage,
     });
+    broadcastMcpInstallationStatus(mcpServer.id, "error", errorMessage);
   }
 }
 
@@ -1303,4 +1335,69 @@ async function assignDiscoveredToolsToAgents(params: {
   await AgentToolModel.bulkCreateForAgentsAndTools(agentIds, toolIds, {
     mcpServerId,
   });
+}
+
+/**
+ * Authorize a `deploy_mcp_server` call against the requested scope.
+ * Mirrors the canonical rule from routes/mcp-server.ts:validateScopeAndAuthorization.
+ * Returns an error message string if rejected, or null if allowed.
+ */
+async function authorizeDeployScope(params: {
+  scope: ResourceVisibilityScope;
+  teamId: string | null;
+  userId: string;
+  organizationId: string;
+}): Promise<string | null> {
+  const { scope, teamId, userId, organizationId } = params;
+
+  if (scope === "team" && !teamId) {
+    return "teamId is required for team-scoped MCP server installations.";
+  }
+  if (scope !== "team" && teamId) {
+    return "teamId should not be provided for non-team MCP server installations.";
+  }
+
+  if (scope === "team" && teamId) {
+    const team = await TeamModel.findById(teamId);
+    if (!team) {
+      return "Team not found.";
+    }
+    const isTeamAdmin = await userHasPermission(
+      userId,
+      organizationId,
+      "team",
+      "admin",
+    );
+    if (isTeamAdmin) {
+      return null;
+    }
+    const hasMcpServerUpdate = await userHasPermission(
+      userId,
+      organizationId,
+      "mcpServerInstallation",
+      "update",
+    );
+    if (!hasMcpServerUpdate) {
+      return "You don't have permission to create team MCP server installations.";
+    }
+    const isMember = await TeamModel.isUserInTeam(teamId, userId);
+    if (!isMember) {
+      return "You can only create MCP server installations for teams you are a member of.";
+    }
+    return null;
+  }
+
+  if (scope === "org") {
+    const isOrgInstallationAdmin = await userHasPermission(
+      userId,
+      organizationId,
+      "mcpServerInstallation",
+      "admin",
+    );
+    if (!isOrgInstallationAdmin) {
+      return "Only mcpServerInstallation admins can install organization-scoped MCP servers.";
+    }
+  }
+
+  return null;
 }

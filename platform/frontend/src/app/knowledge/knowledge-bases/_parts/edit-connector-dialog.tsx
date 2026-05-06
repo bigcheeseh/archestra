@@ -1,13 +1,9 @@
 "use client";
 
-import {
-  type archestraApiTypes,
-  DocsPage,
-  getConnectorNamePlaceholder,
-} from "@shared";
+import { type archestraApiTypes, getConnectorNamePlaceholder } from "@shared";
 import { ChevronDown } from "lucide-react";
 import { useEffect, useState } from "react";
-import { useForm } from "react-hook-form";
+import { type Path, useForm } from "react-hook-form";
 import { KnowledgeSourceVisibilitySelector } from "@/app/knowledge/_parts/knowledge-source-visibility-selector";
 import { ExternalDocsLink } from "@/components/external-docs-link";
 import { StandardFormDialog } from "@/components/standard-dialog";
@@ -28,18 +24,18 @@ import {
 } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
-import { getFrontendDocsUrl } from "@/lib/docs/docs";
 import { useUpdateConnector } from "@/lib/knowledge/connector.query";
-import { ConfluenceConfigFields } from "./confluence-config-fields";
+import {
+  ConnectorAdvancedConfigFields,
+  ConnectorInlineConfigFields,
+  connectorNeedsEmail,
+  getConnectorCredentialConfig,
+  getConnectorDocsUrl,
+  getConnectorTypeLabel,
+  getConnectorUrlConfig,
+} from "./connector-dialog-config";
 import { ConnectorTypeIcon } from "./connector-icons";
-import { GoogleDriveConfigFields } from "./gdrive-config-fields";
-import { GithubConfigFields } from "./github-config-fields";
-import { GitlabConfigFields } from "./gitlab-config-fields";
-import { JiraConfigFields } from "./jira-config-fields";
-import { NotionConfigFields } from "./notion-config-fields";
 import { SchedulePicker } from "./schedule-picker";
-import { ServiceNowConfigFields } from "./servicenow-config-fields";
-import { SharePointConfigFields } from "./sharepoint-config-fields";
 import { transformConfigArrayFields } from "./transform-config-array-fields";
 
 type ConnectorItem = Pick<
@@ -55,7 +51,7 @@ type ConnectorItem = Pick<
   | "enabled"
 >;
 
-interface EditConnectorFormValues {
+type EditConnectorFormValues = {
   name: string;
   description: string;
   enabled: boolean;
@@ -63,7 +59,7 @@ interface EditConnectorFormValues {
   email: string;
   apiToken: string;
   schedule: string;
-}
+};
 
 export function EditConnectorDialog({
   connector,
@@ -107,12 +103,19 @@ export function EditConnectorDialog({
   }, [open, connector, form]);
 
   const connectorType = connector.connectorType;
-  const { typeLabel, urlFields: urlConfig } = getEditUrlConfig(connectorType);
+  const typeLabel = getConnectorTypeLabel(connectorType);
+  const urlConfig = getConnectorUrlConfig(connectorType);
   const connectorDocsUrl = getConnectorDocsUrl(connectorType);
 
-  const needsEmail = connectorType === "jira" || connectorType === "confluence";
+  const needsEmail = connectorNeedsEmail(connectorType);
   const isCloud = form.watch("config.isCloud") as boolean | undefined;
   const emailRequired = needsEmail && isCloud !== false;
+  const { apiTokenHelpText, apiTokenLabel, apiTokenPlaceholder } =
+    getConnectorCredentialConfig({
+      type: connectorType,
+      emailRequired,
+      mode: "edit",
+    });
 
   const handleSubmit = async (values: EditConnectorFormValues) => {
     const hasCredentials = values.apiToken.length > 0;
@@ -258,8 +261,7 @@ export function EditConnectorDialog({
           {urlConfig && (
             <FormField
               control={form.control}
-              // biome-ignore lint/suspicious/noExplicitAny: dynamic field name for connector-specific URL
-              name={urlConfig.fieldName as any}
+              name={urlConfig.fieldName as Path<EditConnectorFormValues>}
               rules={{ required: `${urlConfig.label} is required` }}
               render={({ field }) => (
                 <FormItem>
@@ -278,300 +280,55 @@ export function EditConnectorDialog({
             />
           )}
 
-          {(connectorType === "jira" || connectorType === "confluence") && (
-            <FormField
-              control={form.control}
-              // biome-ignore lint/suspicious/noExplicitAny: dynamic field name for connector config
-              name={"config.isCloud" as any}
-              render={({ field }) => (
-                <FormItem className="flex items-center justify-between rounded-lg border p-3">
-                  <div className="space-y-0.5">
-                    <FormLabel>Cloud Instance</FormLabel>
-                    <FormDescription>
-                      Enable if this is a cloud-hosted instance.
-                    </FormDescription>
-                  </div>
-                  <FormControl>
-                    <Switch
-                      checked={(field.value as boolean) ?? true}
-                      onCheckedChange={field.onChange}
-                    />
-                  </FormControl>
-                </FormItem>
-              )}
-            />
-          )}
-
-          {needsEmail && (
-            <FormField
-              control={form.control}
-              name="email"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Email{!emailRequired && " (optional)"}</FormLabel>
-                  <FormControl>
-                    <Input
-                      type="email"
-                      placeholder={
-                        emailRequired
-                          ? "user@example.com"
-                          : "Required for basic auth, leave empty for PAT"
-                      }
-                      {...field}
-                    />
-                  </FormControl>
-                  <FormDescription>
-                    Leave empty to keep existing credentials unchanged.
-                  </FormDescription>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-          )}
-
-          {connectorType === "servicenow" && (
-            <FormField
-              control={form.control}
-              name="email"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Username</FormLabel>
-                  <FormControl>
-                    <Input placeholder="admin" {...field} />
-                  </FormControl>
-                  <FormDescription>
-                    Leave empty to keep existing credentials unchanged.
-                  </FormDescription>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-          )}
-
-          {connectorType === "sharepoint" && (
-            <FormField
-              control={form.control}
-              name="config.tenantId"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Tenant ID</FormLabel>
-                  <FormControl>
-                    <Input
-                      placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-                      {...field}
-                      value={(field.value as string) ?? ""}
-                    />
-                  </FormControl>
-                  <FormDescription>
-                    Your Azure AD (Entra ID) tenant ID or domain.
-                  </FormDescription>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-          )}
-
-          {connectorType === "sharepoint" && (
-            <FormField
-              control={form.control}
-              name="email"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Client ID</FormLabel>
-                  <FormControl>
-                    <Input
-                      placeholder="Leave empty to keep existing credentials"
-                      {...field}
-                    />
-                  </FormControl>
-                  <FormDescription>
-                    Azure AD app registration Client ID.
-                  </FormDescription>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-          )}
-
-          <FormField
-            control={form.control}
-            name="apiToken"
-            render={({ field }) => (
-              <FormItem>
-                <FormLabel>
-                  {connectorType === "servicenow"
-                    ? "Password"
-                    : connectorType === "notion"
-                      ? "Integration Token"
-                      : connectorType === "sharepoint"
-                        ? "Client Secret"
-                        : connectorType === "gdrive"
-                          ? "Service Account Key / OAuth Token"
-                          : needsEmail
-                            ? emailRequired
-                              ? "API Token"
-                              : "API Token / Personal Access Token"
-                            : "Personal Access Token"}
-                </FormLabel>
-                <FormControl>
-                  <Input
-                    type="password"
-                    placeholder={
-                      connectorType === "servicenow"
-                        ? "Leave empty to keep existing password"
-                        : "Leave empty to keep existing token"
-                    }
-                    {...field}
-                  />
-                </FormControl>
-                <FormDescription>
-                  Leave empty to keep existing credentials unchanged.
-                </FormDescription>
-                {connectorType === "sharepoint" && (
-                  <p className="text-[0.8rem] text-muted-foreground">
-                    The Azure AD app registration requires the{" "}
-                    <code>Sites.Read.All</code> permission on Microsoft Graph.
-                  </p>
-                )}
-                {connectorType === "gdrive" && (
-                  <p className="text-[0.8rem] text-muted-foreground">
-                    Paste a service account JSON key (entire file content) or an
-                    OAuth2 access token with <code>drive.readonly</code> scope.
-                  </p>
-                )}
-                <FormMessage />
-              </FormItem>
-            )}
+          <ConnectorInlineConfigFields
+            connectorType={connectorType}
+            form={form}
+            mode="edit"
+            emailRequired={emailRequired}
           />
 
-          <Collapsible>
-            <CollapsibleTrigger className="flex w-full items-center justify-between cursor-pointer group border-t pt-3">
-              <span className="text-sm font-medium">Advanced</span>
-              <ChevronDown className="h-4 w-4 text-muted-foreground transition-transform duration-200 group-data-[state=open]:rotate-180" />
-            </CollapsibleTrigger>
-            <CollapsibleContent className="pt-4 space-y-4">
-              <SchedulePicker form={form} name="schedule" />
-              {connectorType === "jira" && (
-                <JiraConfigFields form={form} hideUrl hideIsCloud />
-              )}
-              {connectorType === "confluence" && (
-                <ConfluenceConfigFields form={form} hideUrl hideIsCloud />
-              )}
-              {connectorType === "github" && (
-                <GithubConfigFields form={form} hideUrl />
-              )}
-              {connectorType === "gitlab" && (
-                <GitlabConfigFields form={form} hideUrl />
-              )}
-              {connectorType === "servicenow" && (
-                <ServiceNowConfigFields form={form} hideUrl />
-              )}
-              {connectorType === "notion" && <NotionConfigFields form={form} />}
-              {connectorType === "sharepoint" && (
-                <SharePointConfigFields form={form} />
-              )}
-              {connectorType === "gdrive" && (
-                <GoogleDriveConfigFields form={form} />
-              )}
-            </CollapsibleContent>
-          </Collapsible>
+          {Boolean(apiTokenLabel) && (
+            <>
+              <FormField
+                control={form.control}
+                name="apiToken"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>{apiTokenLabel}</FormLabel>
+                    <FormControl>
+                      <Input
+                        type="password"
+                        placeholder={apiTokenPlaceholder}
+                        {...field}
+                      />
+                    </FormControl>
+                    <FormDescription>
+                      Leave empty to keep existing credentials unchanged.
+                    </FormDescription>
+                    {apiTokenHelpText}
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <Collapsible>
+                <CollapsibleTrigger className="flex w-full items-center justify-between cursor-pointer group border-t pt-3">
+                  <span className="text-sm font-medium">Advanced</span>
+                  <ChevronDown className="h-4 w-4 text-muted-foreground transition-transform duration-200 group-data-[state=open]:rotate-180" />
+                </CollapsibleTrigger>
+                <CollapsibleContent className="pt-4 space-y-4">
+                  <SchedulePicker form={form} name="schedule" />
+                  <ConnectorAdvancedConfigFields
+                    connectorType={connectorType}
+                    form={form}
+                    mode="edit"
+                  />
+                </CollapsibleContent>
+              </Collapsible>
+            </>
+          )}
         </div>
       </Form>
     </StandardFormDialog>
   );
-}
-
-type ConnectorType =
-  archestraApiTypes.CreateConnectorData["body"]["connectorType"];
-
-function getEditUrlConfig(type: ConnectorType): {
-  typeLabel: string;
-  urlFields: {
-    fieldName: string;
-    label: string;
-    placeholder: string;
-    description: string;
-  } | null;
-} {
-  switch (type) {
-    case "jira":
-      return {
-        typeLabel: "Jira",
-        urlFields: {
-          fieldName: "config.jiraBaseUrl",
-          label: "URL",
-          placeholder: "https://your-domain.atlassian.net",
-          description: "Your Jira instance URL.",
-        },
-      };
-    case "confluence":
-      return {
-        typeLabel: "Confluence",
-        urlFields: {
-          fieldName: "config.confluenceUrl",
-          label: "URL",
-          placeholder: "https://your-domain.atlassian.net/wiki",
-          description: "Your Confluence instance URL.",
-        },
-      };
-    case "github":
-      return {
-        typeLabel: "GitHub",
-        urlFields: {
-          fieldName: "config.githubUrl",
-          label: "GitHub API URL",
-          placeholder: "https://api.github.com",
-          description:
-            "Use https://api.github.com for GitHub.com, or your GitHub Enterprise API URL.",
-        },
-      };
-    case "gitlab":
-      return {
-        typeLabel: "GitLab",
-        urlFields: {
-          fieldName: "config.gitlabUrl",
-          label: "GitLab URL",
-          placeholder: "https://gitlab.com",
-          description: "Use https://gitlab.com or your self-hosted GitLab URL.",
-        },
-      };
-    case "servicenow":
-      return {
-        typeLabel: "ServiceNow",
-        urlFields: {
-          fieldName: "config.instanceUrl",
-          label: "Instance URL",
-          placeholder: "https://your-instance.service-now.com",
-          description: "Your ServiceNow instance URL.",
-        },
-      };
-    case "notion":
-      return { typeLabel: "Notion", urlFields: null };
-    case "gdrive":
-      return { typeLabel: "Google Drive", urlFields: null };
-    case "sharepoint":
-      return {
-        typeLabel: "SharePoint",
-        urlFields: {
-          fieldName: "config.siteUrl",
-          label: "Site URL",
-          placeholder: "https://your-tenant.sharepoint.com/sites/your-site",
-          description: "Your SharePoint site URL.",
-        },
-      };
-    default:
-      return {
-        typeLabel: type,
-        urlFields: {
-          fieldName: "config.url",
-          label: "URL",
-          placeholder: "",
-          description: "",
-        },
-      };
-  }
-}
-
-function getConnectorDocsUrl(type: ConnectorType): string | null {
-  return getFrontendDocsUrl(DocsPage.PlatformKnowledgeConnectors, type);
 }

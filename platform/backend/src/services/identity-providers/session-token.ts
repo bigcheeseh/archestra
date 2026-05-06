@@ -4,7 +4,7 @@ import { AccountModel, AgentModel } from "@/models";
 import { refreshLinkedIdentityProviderAccessToken } from "@/services/identity-providers/access-token-refresh";
 import { findExternalIdentityProviderById } from "@/services/identity-providers/oidc";
 
-export interface SessionExternalIdpToken {
+interface SessionExternalIdpToken {
   identityProviderId: string;
   providerId: string;
   rawToken: string;
@@ -102,7 +102,7 @@ function resolveSubjectTokenPreference(identityProvider: {
   oidcConfig?: {
     enterpriseManagedCredentials?: {
       subjectTokenType?: string;
-      providerType?: string;
+      exchangeStrategy?: string;
     };
   } | null;
 }): "access_token" | "id_token" {
@@ -113,8 +113,10 @@ function resolveSubjectTokenPreference(identityProvider: {
   }
 
   if (
-    identityProvider.oidcConfig?.enterpriseManagedCredentials?.providerType ===
-    "keycloak"
+    identityProvider.oidcConfig?.enterpriseManagedCredentials
+      ?.exchangeStrategy === "rfc8693" ||
+    identityProvider.oidcConfig?.enterpriseManagedCredentials
+      ?.exchangeStrategy === "entra_obo"
   ) {
     return "access_token";
   }

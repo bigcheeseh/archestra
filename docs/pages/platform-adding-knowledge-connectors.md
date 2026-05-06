@@ -2,19 +2,19 @@
 title: Adding Knowledge Connectors
 category: Development
 order: 3
-description: Developer guide for implementing new knowledge base connectors in Archestra Platform
-lastUpdated: 2026-04-15
+description: Developer guide for implementing new Knowledge Base connectors in Archestra Platform
+lastUpdated: 2026-05-05
 ---
 
 <!--
 Check ../docs_writer_prompt.md before changing this file.
 
-This is a development guide for adding new knowledge base connectors to Archestra.
+This is a development guide for adding new Knowledge Base connectors to Archestra.
 -->
 
 ## Overview
 
-This guide covers how to add a new knowledge connector to Archestra Platform. Connectors pull data from external tools (Jira, Confluence, GitHub, GitLab, etc.) into knowledge bases on a schedule. Each connector requires:
+This guide covers how to add a new Knowledge Connector to Archestra Platform. Connectors pull data from external tools (Jira, Confluence, GitHub, GitLab, etc.) into Knowledge Bases on a schedule. Each connector requires:
 
 1. **Zod schemas** for config, checkpoint, and the `type` literal
 2. **Connector class** extending `BaseConnector` with `validateConfig`, `testConnection`, and `sync`
@@ -112,7 +112,7 @@ import type {
   GithubConfig,
 } from "@/types/knowledge-connector";
 import { GithubConfigSchema } from "@/types/knowledge-connector";
-import { BaseConnector } from "../base-connector";
+import { BaseConnector, buildCheckpoint } from "../base-connector";
 
 const BATCH_SIZE = 50;
 
@@ -206,16 +206,19 @@ export class GithubConnector extends BaseConnector {
       hasMore = issues.length >= BATCH_SIZE;
       page++;
 
+      const lastIssue = issues.at(-1);
+
       yield {
         documents,
-        checkpoint: {
+        failures: this.flushFailures(),
+        checkpoint: buildCheckpoint({
           type: "github",
-          lastSyncedAt: new Date().toISOString(),
-          lastIssueNumber:
-            issues.length > 0
-              ? issues[issues.length - 1].number
-              : checkpoint.lastIssueNumber,
-        },
+          itemUpdatedAt: lastIssue?.updated_at,
+          previousLastSyncedAt: checkpoint.lastSyncedAt,
+          extra: {
+            lastIssueNumber: lastIssue?.number ?? checkpoint.lastIssueNumber,
+          },
+        }),
         hasMore,
       };
     }
@@ -233,6 +236,11 @@ export class GithubConnector extends BaseConnector {
 | `rateLimit()`                               | Sleep for the configured delay (default 100ms) between API calls to avoid rate limits           |
 | `joinUrl(base, path)`                       | Normalize and join URL parts                                                                    |
 | `buildBasicAuthHeader(email, token)`        | Build a `Basic` auth header                                                                     |
+| `safeItemFetch({ fetch, fallback, itemId, resource })` | Fetch optional per-item sub-resources without failing the whole batch |
+| `flushFailures()`                           | Return and clear item-level failures collected by `safeItemFetch`                               |
+| `trackSkipped(item)` / `flushSkipped()`     | Track intentionally skipped source items and include them in the next yielded batch              |
+
+Use the exported `buildCheckpoint(...)` helper to construct checkpoints. It derives `lastSyncedAt` from the most recent source item timestamp and falls back to the previous checkpoint for empty batches. Do not use wall-clock time for `lastSyncedAt`; doing so can skip source updates when APIs return delayed or out-of-order results.
 
 ### SDK selection note
 
@@ -247,6 +255,9 @@ Key points:
 - Call `await this.rateLimit()` before each API call
 - Set `hasMore: true` on intermediate batches, `false` on the final one
 - Always include the `type` field in the checkpoint object
+- Use `buildCheckpoint(...)` so `lastSyncedAt` comes from source item timestamps, not the current time
+- Include `failures: this.flushFailures()` when using `safeItemFetch(...)`
+- Include `skipped: this.flushSkipped()` when the connector intentionally skips source items
 - The checkpoint is opaque to the runtime; only your connector reads it
 
 ## Connector Registry
@@ -341,6 +352,12 @@ import { GithubConfigFields } from "./github-config-fields";
 
 Update the `CreateConnectorFormValues` type to include the new connector type in the `connectorType` union.
 
+## Subfolder Traversal
+
+If your connector needs to traverse a folder hierarchy recursively, use the shared `traverseFolders` utility at `platform/backend/src/knowledge-base/connectors/folder-traversal.ts` rather than implementing your own BFS logic.
+
+Implement the `FolderTraversalAdapter` interface with a `listDirectSubfolders` method for your service, then pass it to `traverseFolders`. It handles BFS ordering, depth limiting via `maxDepth`, and skips branches that fail without aborting the sync. See the Dropbox and Google Drive connectors for reference.
+
 ## User-Facing Docs
 
 When you add a new connector, you must also add or update the matching section in `docs/pages/platform-knowledge-connectors.md`.
@@ -364,7 +381,7 @@ If your connector needs a migration (e.g., a new column), follow the standard Dr
 
 ## Testing
 
-Create `backend/src/knowledge-base/connectors/github/github-connector.test.ts`. Mock the external SDK or HTTP calls; test the three interface methods.
+Create a colocated test file next to the connector implementation, for example `backend/src/knowledge-base/connectors/<connector>/<connector>-connector.test.ts`. Mock the external SDK or HTTP calls; test the connector interface methods.
 
 Structure your test file with three `describe` blocks matching the interface:
 
@@ -375,18 +392,3 @@ Structure your test file with three `describe` blocks matching the interface:
 | `sync`           | Single-page results, pagination across multiple pages, incremental sync using checkpoint, label/filter exclusion, document metadata mapping, API errors propagate |
 
 Use `vi.mock()` to mock the external client library. See `backend/src/knowledge-base/connectors/jira/jira-connector.test.ts` for a complete example.
-
-## Reference Implementations
-
-| Connector    | Files                                                                                                                                                                          |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Jira         | `backend/src/knowledge-base/connectors/jira/jira-connector.ts`, `frontend/src/app/knowledge/knowledge-bases/_parts/jira-config-fields.tsx`                                     |
-| Confluence   | `backend/src/knowledge-base/connectors/confluence/confluence-connector.ts`, `frontend/src/app/knowledge/knowledge-bases/_parts/confluence-config-fields.tsx`                    |
-| GitHub       | `backend/src/knowledge-base/connectors/github/github-connector.ts`, `frontend/src/app/knowledge/knowledge-bases/_parts/github-config-fields.tsx`                               |
-| GitLab       | `backend/src/knowledge-base/connectors/gitlab/gitlab-connector.ts`, `frontend/src/app/knowledge/knowledge-bases/_parts/gitlab-config-fields.tsx`                               |
-| ServiceNow   | `backend/src/knowledge-base/connectors/servicenow/servicenow-connector.ts`, `frontend/src/app/knowledge/knowledge-bases/_parts/servicenow-config-fields.tsx`                   |
-| Notion       | `backend/src/knowledge-base/connectors/notion/notion-connector.ts`, `frontend/src/app/knowledge/knowledge-bases/_parts/notion-config-fields.tsx`                               |
-| SharePoint   | `backend/src/knowledge-base/connectors/sharepoint/sharepoint-connector.ts`, `frontend/src/app/knowledge/knowledge-bases/_parts/sharepoint-config-fields.tsx`                   |
-| Google Drive | `backend/src/knowledge-base/connectors/gdrive/gdrive-connector.ts`, `frontend/src/app/knowledge/knowledge-bases/_parts/gdrive-config-fields.tsx`                               |
-
-The Jira connector is the best starting point -- it demonstrates both Cloud and Server API handling, ADF text extraction, comment filtering, and JQL-based incremental sync. The GitHub and GitLab connectors demonstrate using official SDKs (`@octokit/rest` and `@gitbeaker/rest`) with separate issue/PR sync passes and label filtering. The ServiceNow connector demonstrates using raw `fetch` calls against the ServiceNow Table API with offset-based pagination. The Google Drive connector demonstrates using the official `googleapis` SDK with service account / OAuth2 auth, recursive folder traversal, and Google Workspace file exports.

@@ -25,6 +25,75 @@ function makeOidcFormValues(
 }
 
 describe("normalizeIdentityProviderFormValues", () => {
+  it("clears allowed email domains for non-Google OIDC providers", () => {
+    const normalized = normalizeIdentityProviderFormValues(
+      makeOidcFormValues({
+        providerId: "Okta",
+        domain: "example.com",
+      }),
+    );
+
+    expect(normalized.domain).toBe("");
+  });
+
+  it("keeps allowed email domains for Google providers", () => {
+    const normalized = normalizeIdentityProviderFormValues(
+      makeOidcFormValues({
+        providerId: "Google",
+        domain: "example.com",
+      }),
+    );
+
+    expect(normalized.domain).toBe("example.com");
+  });
+
+  it("syncs the nested OIDC issuer with the visible issuer field", () => {
+    const normalized = normalizeIdentityProviderFormValues(
+      makeOidcFormValues({
+        issuer: "https://integrator-8514409.okta.com",
+        providerId: "Okta",
+        oidcConfig: {
+          issuer: "https://your-domain.okta.com",
+          pkce: true,
+          clientId: "client-id",
+          clientSecret: "client-secret",
+          discoveryEndpoint:
+            "https://your-domain.okta.com/.well-known/openid-configuration",
+          mapping: { id: "sub", email: "email", name: "name" },
+        },
+      }),
+    );
+
+    expect(normalized.oidcConfig?.issuer).toBe(
+      "https://integrator-8514409.okta.com",
+    );
+    expect(normalized.oidcConfig?.discoveryEndpoint).toBe(
+      "https://integrator-8514409.okta.com/.well-known/openid-configuration",
+    );
+  });
+
+  it("keeps a custom discovery endpoint while syncing the nested OIDC issuer", () => {
+    const normalized = normalizeIdentityProviderFormValues(
+      makeOidcFormValues({
+        issuer: "https://login.example.com",
+        oidcConfig: {
+          issuer: "https://old-login.example.com",
+          pkce: true,
+          clientId: "client-id",
+          clientSecret: "client-secret",
+          discoveryEndpoint:
+            "https://discovery.example.com/.well-known/openid-configuration",
+          mapping: { id: "sub", email: "email", name: "name" },
+        },
+      }),
+    );
+
+    expect(normalized.oidcConfig?.issuer).toBe("https://login.example.com");
+    expect(normalized.oidcConfig?.discoveryEndpoint).toBe(
+      "https://discovery.example.com/.well-known/openid-configuration",
+    );
+  });
+
   it("fills inferred Keycloak enterprise-managed defaults when the section is used", () => {
     const normalized = normalizeIdentityProviderFormValues(
       makeOidcFormValues({
@@ -48,7 +117,7 @@ describe("normalizeIdentityProviderFormValues", () => {
 
     expect(normalized.oidcConfig?.enterpriseManagedCredentials).toEqual(
       expect.objectContaining({
-        providerType: "keycloak",
+        exchangeStrategy: "rfc8693",
         tokenEndpointAuthentication: "client_secret_post",
         subjectTokenType: "urn:ietf:params:oauth:token-type:access_token",
       }),
@@ -96,9 +165,41 @@ describe("normalizeIdentityProviderFormValues", () => {
 
     expect(normalized.oidcConfig?.enterpriseManagedCredentials).toEqual(
       expect.objectContaining({
-        providerType: "generic_oidc",
-        tokenEndpointAuthentication: "private_key_jwt",
-        subjectTokenType: "urn:ietf:params:oauth:token-type:id_token",
+        exchangeStrategy: "rfc8693",
+        tokenEndpointAuthentication: "client_secret_post",
+        subjectTokenType: "urn:ietf:params:oauth:token-type:access_token",
+      }),
+    );
+  });
+
+  it("fills inferred Entra enterprise-managed defaults when the section is used", () => {
+    const normalized = normalizeIdentityProviderFormValues(
+      makeOidcFormValues({
+        providerId: "EntraID",
+        issuer: "https://login.microsoftonline.com/test-tenant/v2.0",
+        oidcConfig: {
+          issuer: "https://login.microsoftonline.com/test-tenant/v2.0",
+          pkce: true,
+          clientId: "archestra-oidc",
+          clientSecret: "archestra-oidc-secret",
+          discoveryEndpoint:
+            "https://login.microsoftonline.com/test-tenant/v2.0/.well-known/openid-configuration",
+          mapping: { id: "sub", email: "email", name: "name" },
+          enterpriseManagedCredentials: {
+            clientId: "archestra-oidc",
+            clientSecret: "archestra-oidc-secret",
+            tokenEndpoint:
+              "https://login.microsoftonline.com/test-tenant/oauth2/v2.0/token",
+          },
+        },
+      }),
+    );
+
+    expect(normalized.oidcConfig?.enterpriseManagedCredentials).toEqual(
+      expect.objectContaining({
+        exchangeStrategy: "entra_obo",
+        tokenEndpointAuthentication: "client_secret_post",
+        subjectTokenType: "urn:ietf:params:oauth:token-type:access_token",
       }),
     );
   });

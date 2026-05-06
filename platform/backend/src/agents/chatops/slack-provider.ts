@@ -1,8 +1,13 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { SLACK_REQUIRED_BOT_SCOPES, TimeInMs } from "@shared";
+import {
+  buildSlackSlashCommandsForCommand,
+  getSlackSlashCommandAction,
+  SLACK_REQUIRED_BOT_SCOPES,
+  SLACK_SLASH_COMMANDS,
+  TimeInMs,
+} from "@shared";
 import { SocketModeClient } from "@slack/socket-mode";
-import { WebClient } from "@slack/web-api";
-import { slackifyMarkdown } from "slackify-markdown";
+import { type Button, type ColorScheme, WebClient } from "@slack/web-api";
 import {
   type AllowedCacheKey,
   CacheKey,
@@ -12,6 +17,8 @@ import {
 import logger from "@/logging";
 import { AgentModel, ChatOpsChannelBindingModel, UserModel } from "@/models";
 import type {
+  AddApprovalRequestFormOptions,
+  ChatOpsApprovalDecision,
   ChatOpsConnectionMode,
   ChatOpsEventHandler,
   ChatOpsProvider,
@@ -23,6 +30,7 @@ import type {
   IncomingChatMessage,
   SlackDbConfig,
   ThreadHistoryParams,
+  UpdateApprovalRequestOptions,
 } from "@/types";
 import {
   autoProvisionUser,
@@ -33,7 +41,6 @@ import {
   CHATOPS_ATTACHMENT_LIMITS,
   CHATOPS_THREAD_HISTORY,
   SLACK_DEFAULT_CONNECTION_MODE,
-  SLACK_SLASH_COMMANDS,
 } from "./constants";
 import { EventDedupMap, errorMessage, isSlackDmChannel } from "./utils";
 
@@ -86,6 +93,22 @@ class SlackProvider implements ChatOpsProvider {
 
   setEventHandler(handler: ChatOpsEventHandler): void {
     this.eventHandler = handler;
+  }
+
+  async handleInteractivePayload(payload: unknown): Promise<void> {
+    const approvalDecision = this.parseApprovalPayload(payload);
+    if (approvalDecision) {
+      await this.eventHandler?.handleInteractiveApprovalDecision(
+        this,
+        approvalDecision,
+      );
+      return;
+    }
+
+    const selection = this.parseInteractivePayload(payload);
+    if (!selection) return;
+
+    await this.eventHandler?.handleInteractiveSelection(this, payload);
   }
 
   async initialize(): Promise<void> {
@@ -298,46 +321,13 @@ class SlackProvider implements ChatOpsProvider {
       throw new Error("SlackProvider not initialized");
     }
 
-    const mrkdwn = slackifyMarkdown(options.text);
-
-    // Slack section blocks have a 3000-char limit; split long responses
-    // into multiple blocks to avoid silent truncation.
+    // Slack's native markdown block preserves standard markdown from LLMs
+    // better than converting to mrkdwn first.
     // biome-ignore lint/suspicious/noExplicitAny: Block Kit types are complex; shape is correct
-    const blocks: any[] = [];
-    const SECTION_LIMIT = 3000;
-    if (mrkdwn.length <= SECTION_LIMIT) {
-      blocks.push({
-        type: "section",
-        text: { type: "mrkdwn", text: mrkdwn },
-      });
-    } else {
-      // Split on double-newline boundaries to keep paragraphs intact
-      let remaining = mrkdwn;
-      while (remaining.length > 0) {
-        if (remaining.length <= SECTION_LIMIT) {
-          blocks.push({
-            type: "section",
-            text: { type: "mrkdwn", text: remaining },
-          });
-          break;
-        }
-        // Find last double-newline within the limit
-        let splitAt = remaining.lastIndexOf("\n\n", SECTION_LIMIT);
-        if (splitAt <= 0) {
-          // Fall back to last single newline
-          splitAt = remaining.lastIndexOf("\n", SECTION_LIMIT);
-        }
-        if (splitAt <= 0) {
-          // No good break point — hard split
-          splitAt = SECTION_LIMIT;
-        }
-        blocks.push({
-          type: "section",
-          text: { type: "mrkdwn", text: remaining.slice(0, splitAt) },
-        });
-        remaining = remaining.slice(splitAt).trim();
-      }
-    }
+    const blocks: any[] = splitSlackMarkdownText(options.text).map((text) => ({
+      type: "markdown",
+      text,
+    }));
 
     if (options.footer) {
       blocks.push({
@@ -354,12 +344,85 @@ class SlackProvider implements ChatOpsProvider {
 
     const result = await this.client.chat.postMessage({
       channel: options.originalMessage.channelId,
-      text: mrkdwn,
+      text: options.footer
+        ? `${options.text}\n\n${options.footer}`
+        : options.text,
       blocks,
       thread_ts: options.originalMessage.threadId,
     });
 
     return (result.ts as string) || "";
+  }
+
+  async addApprovalRequestForm(
+    options: AddApprovalRequestFormOptions,
+  ): Promise<void> {
+    if (!this.client) {
+      throw new Error("SlackProvider not initialized");
+    }
+
+    const generateButton = (
+      text: string,
+      style: ColorScheme,
+      approved: boolean,
+      action: string,
+    ): Button => {
+      return {
+        type: "button",
+        text: {
+          type: "plain_text",
+          text,
+          emoji: true,
+        },
+        action_id: `approval_decision_${options.approvalId}_${action}`,
+        value: JSON.stringify({
+          taskId: options.taskId,
+          approvalId: options.approvalId,
+          toolName: options.toolName,
+          originalMessage: options.originalMessage,
+          approved,
+        }),
+        style,
+      };
+    };
+
+    await this.client.chat.postMessage({
+      channel: options.channelId,
+      text: "",
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: `\`${options.toolName}\``,
+          },
+        },
+        {
+          type: "actions",
+          elements: [
+            generateButton("Approve", "primary", true, "approve"),
+            generateButton("Decline", "danger", false, "decline"),
+          ],
+        },
+      ],
+      thread_ts: options.threadId,
+    });
+  }
+
+  async updateApprovalRequest(
+    options: UpdateApprovalRequestOptions,
+  ): Promise<void> {
+    if (!this.client) {
+      throw new Error("SlackProvider not initialized");
+    }
+    const status = options.approved
+      ? ":white_check_mark: Approved"
+      : ":x: Declined";
+    await this.client.chat.update({
+      channel: options.channelId,
+      ts: options.messageKey,
+      text: `\`${options.toolName}\`: ${status}`,
+    });
   }
 
   async sendAgentSelectionCard(params: {
@@ -409,7 +472,11 @@ class SlackProvider implements ChatOpsProvider {
             type: "section",
             text: {
               type: "mrkdwn",
-              text: "*Available commands:*\n`/archestra-select-agent` — Change the default agent handling requests in the channel\n`/archestra-status` — Check the current agent handling requests in the channel\n`/archestra-help` — Show available commands",
+              text:
+                "*Available commands:*\n" +
+                `\`${SLACK_SLASH_COMMANDS.SELECT_AGENT}\` — Change the default agent handling requests in the channel\n` +
+                `\`${SLACK_SLASH_COMMANDS.STATUS}\` — Check the current agent handling requests in the channel\n` +
+                `\`${SLACK_SLASH_COMMANDS.HELP}\` — Show available commands`,
             },
           },
           { type: "divider" },
@@ -692,6 +759,66 @@ class SlackProvider implements ChatOpsProvider {
     };
   }
 
+  parseApprovalPayload(payload: unknown): ChatOpsApprovalDecision | null {
+    const p = payload as SlackInteractivePayload;
+    if (p.type !== "block_actions" || !p.actions?.length) {
+      return null;
+    }
+
+    const action = p.actions[0];
+    if (!action.action_id?.startsWith("approval_decision") || !action.value) {
+      return null;
+    }
+
+    let parsedValue: {
+      taskId?: string;
+      approvalId?: string;
+      approved?: boolean;
+      toolName?: string;
+      originalMessage: IncomingChatMessage;
+    };
+    try {
+      parsedValue = JSON.parse(action.value) as {
+        taskId?: string;
+        approvalId?: string;
+        approved?: boolean;
+        toolName?: string;
+        originalMessage: IncomingChatMessage;
+      };
+    } catch {
+      return null;
+    }
+
+    if (
+      !parsedValue.taskId ||
+      !parsedValue.approvalId ||
+      typeof parsedValue.approved !== "boolean" ||
+      !parsedValue.originalMessage
+    ) {
+      return null;
+    }
+
+    const messageTs = p.message?.ts;
+    if (!messageTs) {
+      return null;
+    }
+
+    return {
+      taskId: parsedValue.taskId,
+      approvalId: parsedValue.approvalId,
+      approved: parsedValue.approved,
+      toolName: parsedValue.toolName || "",
+      messageTs,
+      channelId: p.channel?.id || "",
+      workspaceId: p.team?.id || null,
+      threadTs: p.message?.thread_ts || p.message?.ts,
+      userId: p.user?.id || "unknown",
+      userName: p.user?.name || "Unknown",
+      responseUrl: p.response_url || "",
+      originalMessage: parsedValue.originalMessage,
+    };
+  }
+
   /**
    * Handle a Slack slash command.
    * Returns the response object. Caller is responsible for delivery
@@ -709,6 +836,8 @@ class SlackProvider implements ChatOpsProvider {
     trigger_id?: string;
   }): Promise<{ response_type: string; text: string } | null> {
     const command = body.command;
+    const commandAction = getSlackSlashCommandAction(command);
+    const slashCommands = buildSlackSlashCommandsForCommand(command);
     const channelId = body.channel_id || "";
     const workspaceId = body.team_id || null;
     const userId = body.user_id || "unknown";
@@ -756,19 +885,19 @@ class SlackProvider implements ChatOpsProvider {
       }
     }
 
-    switch (command) {
-      case SLACK_SLASH_COMMANDS.HELP:
+    switch (commandAction) {
+      case "HELP":
         return {
           response_type: "ephemeral",
           text:
             "*Available commands:*\n" +
-            "`/archestra-select-agent` — Change the default agent\n" +
-            "`/archestra-status` — Show current agent binding\n" +
-            "`/archestra-help` — Show this help message\n\n" +
+            `\`${slashCommands.SELECT_AGENT}\` — Change the default agent\n` +
+            `\`${slashCommands.STATUS}\` — Show current agent binding\n` +
+            `\`${slashCommands.HELP}\` — Show this help message\n\n` +
             "Or just send a message to interact with the assigned agent.",
         };
 
-      case SLACK_SLASH_COMMANDS.STATUS: {
+      case "STATUS": {
         const binding = await ChatOpsChannelBindingModel.findByChannel({
           provider: "slack",
           channelId,
@@ -782,7 +911,7 @@ class SlackProvider implements ChatOpsProvider {
             text:
               `This channel is assigned to agent: *${agent?.name || binding.agentId}*\n\n` +
               "*Tip:* You can use other agents with the syntax *AgentName >* (e.g., @Archestra Sales > what's the status?).\n\n" +
-              "Use `/archestra-select-agent` to change the default agent.",
+              `Use \`${slashCommands.SELECT_AGENT}\` to change the default agent.`,
           };
         }
 
@@ -792,7 +921,7 @@ class SlackProvider implements ChatOpsProvider {
         };
       }
 
-      case SLACK_SLASH_COMMANDS.SELECT_AGENT: {
+      case "SELECT_AGENT": {
         // Send agent selection card (visible to all in channel)
         const isDm = isSlackDmChannel(channelId);
         const message: IncomingChatMessage = {
@@ -833,7 +962,7 @@ class SlackProvider implements ChatOpsProvider {
       default:
         return {
           response_type: "ephemeral",
-          text: "Unknown command. Use `/archestra-help` to see available commands.",
+          text: `Unknown command. Use \`${slashCommands.HELP}\` to see available commands.`,
         };
     }
   }
@@ -1101,14 +1230,12 @@ class SlackProvider implements ChatOpsProvider {
           }
           case "interactive":
             await ack();
-            this.eventHandler
-              ?.handleInteractiveSelection(this, body)
-              .catch((error) => {
-                logger.error(
-                  { error: errorMessage(error) },
-                  "[SlackProvider] Error processing socket interactive event",
-                );
-              });
+            this.handleInteractivePayload(body).catch((error) => {
+              logger.error(
+                { error: errorMessage(error) },
+                "[SlackProvider] Error processing socket interactive event",
+              );
+            });
             break;
           case "slash_commands":
             // ack() for slash commands can include a response body
@@ -1430,6 +1557,37 @@ function decodeSlackEntities(text: string): string {
     .replace(/&gt;/g, ">")
     .replace(/&lt;/g, "<")
     .replace(/&amp;/g, "&");
+}
+
+function splitSlackMarkdownText(text: string): string[] {
+  const MARKDOWN_BLOCK_LIMIT = 12_000;
+
+  if (text.length <= MARKDOWN_BLOCK_LIMIT) {
+    return [text];
+  }
+
+  const chunks: string[] = [];
+  let remaining = text;
+
+  while (remaining.length > 0) {
+    if (remaining.length <= MARKDOWN_BLOCK_LIMIT) {
+      chunks.push(remaining);
+      break;
+    }
+
+    let splitAt = remaining.lastIndexOf("\n\n", MARKDOWN_BLOCK_LIMIT);
+    if (splitAt <= 0) {
+      splitAt = remaining.lastIndexOf("\n", MARKDOWN_BLOCK_LIMIT);
+    }
+    if (splitAt <= 0) {
+      splitAt = MARKDOWN_BLOCK_LIMIT;
+    }
+
+    chunks.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt).trim();
+  }
+
+  return chunks;
 }
 
 /**

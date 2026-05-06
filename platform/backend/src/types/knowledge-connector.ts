@@ -11,6 +11,13 @@ const SERVICENOW = z.literal("servicenow");
 const NOTION = z.literal("notion");
 const SHAREPOINT = z.literal("sharepoint");
 const GDRIVE = z.literal("gdrive");
+const FILE_UPLOAD = z.literal("file_upload");
+const DROPBOX = z.literal("dropbox");
+const ONEDRIVE = z.literal("onedrive");
+const ASANA = z.literal("asana");
+const OUTLINE = z.literal("outline");
+const LINEAR = z.literal("linear");
+const SALESFORCE = z.literal("salesforce");
 
 export const ConnectorTypeSchema = z.union([
   JIRA,
@@ -21,6 +28,13 @@ export const ConnectorTypeSchema = z.union([
   NOTION,
   SHAREPOINT,
   GDRIVE,
+  FILE_UPLOAD,
+  DROPBOX,
+  ONEDRIVE,
+  ASANA,
+  LINEAR,
+  OUTLINE,
+  SALESFORCE,
 ]);
 export type ConnectorType = z.infer<typeof ConnectorTypeSchema>;
 
@@ -185,6 +199,8 @@ export const SharePointConfigSchema = z.object({
   siteUrl: connectorUrlSchema,
   driveIds: z.array(z.string()).optional(),
   folderPath: z.string().optional(),
+  recursive: z.boolean().optional(),
+  maxDepth: z.number().int().min(1).max(100).optional(),
   includePages: z.boolean().optional(),
   batchSize: z.number().optional(),
 });
@@ -216,7 +232,170 @@ export const GoogleDriveCheckpointSchema = z.object({
 });
 export type GoogleDriveCheckpoint = z.infer<typeof GoogleDriveCheckpointSchema>;
 
+// ===== File Upload Config & Checkpoint =====
+
+export const FileUploadConfigSchema = z.object({
+  type: FILE_UPLOAD,
+});
+export type FileUploadConfig = z.infer<typeof FileUploadConfigSchema>;
+
+export const FileUploadCheckpointSchema = z.object({
+  type: FILE_UPLOAD,
+  lastSyncedAt: z.string().optional(),
+});
+export type FileUploadCheckpoint = z.infer<typeof FileUploadCheckpointSchema>;
+// ===== Asana Config & Checkpoint =====
+
+export const AsanaConfigSchema = z.object({
+  type: ASANA,
+  workspaceGid: z.string().min(1),
+  projectGids: z.array(z.string()).optional(),
+  tagsToSkip: z.array(z.string()).optional(),
+});
+export type AsanaConfig = z.infer<typeof AsanaConfigSchema>;
+
+export const AsanaCheckpointSchema = z.object({
+  type: ASANA,
+  lastSyncedAt: z.string().optional(),
+});
+export type AsanaCheckpoint = z.infer<typeof AsanaCheckpointSchema>;
+
+// ===== Linear Config & Checkpoint =====
+
+export const LinearConfigSchema = z.object({
+  type: LINEAR,
+  linearApiUrl: connectorUrlSchema.optional().default("https://api.linear.app"),
+  teamIds: z.array(z.string()).optional(),
+  projectIds: z.array(z.string()).optional(),
+  states: z.array(z.string()).optional(),
+  includeComments: z.boolean().optional(),
+  includeProjects: z.boolean().optional(),
+  includeCycles: z.boolean().optional(),
+  batchSize: z.number().int().positive().optional(),
+});
+export type LinearConfig = z.infer<typeof LinearConfigSchema>;
+
+export const LinearCheckpointSchema = z.object({
+  type: LINEAR,
+  lastSyncedAt: z.string().optional(),
+  /** High-water `updatedAt` (ISO) after a completed issues sweep; drives the next incremental issues lower bound. */
+  lastRawUpdatedAt: z.string().optional(),
+  /** Active sync phase for multi-entity runs (resume across batches). */
+  linearSyncPhase: z.enum(["issues", "projects", "cycles"]).optional(),
+  issuePageCursor: z.string().optional(),
+  /**
+   * `updatedAt: { gt }` lower bound for the in-flight issues sweep.
+   * Kept stable while paginating; cleared when the issues sweep completes.
+   */
+  issueUpdatedAfter: z.string().optional(),
+  projectLastRawUpdatedAt: z.string().optional(),
+  projectPageCursor: z.string().optional(),
+  projectUpdatedAfter: z.string().optional(),
+  cycleLastRawUpdatedAt: z.string().optional(),
+  cyclePageCursor: z.string().optional(),
+  cycleUpdatedAfter: z.string().optional(),
+});
+export type LinearCheckpoint = z.infer<typeof LinearCheckpointSchema>;
+
+// ===== Salesforce Config & Checkpoint =====
+
+export const SalesforceConfigSchema = z.object({
+  type: SALESFORCE,
+  loginUrl: connectorUrlSchema
+    .optional()
+    .default("https://login.salesforce.com"),
+  objects: z.array(z.string().min(1)).optional(),
+  advancedObjectConfigJson: z
+    .string()
+    .optional()
+    .refine(
+      (value) => {
+        if (!value) return true;
+        try {
+          const parsed = JSON.parse(value);
+          return (
+            typeof parsed === "object" &&
+            parsed !== null &&
+            !Array.isArray(parsed)
+          );
+        } catch {
+          return false;
+        }
+      },
+      {
+        message:
+          "advancedObjectConfigJson must be valid JSON object text when provided",
+      },
+    ),
+});
+export type SalesforceConfig = z.infer<typeof SalesforceConfigSchema>;
+
+export const SalesforceCheckpointSchema = z.object({
+  type: SALESFORCE,
+  lastSyncedAt: z.string().optional(),
+  objectCursorMap: z.record(z.string(), z.string()).optional(),
+});
+export type SalesforceCheckpoint = z.infer<typeof SalesforceCheckpointSchema>;
+
 // ===== Discriminated Unions =====
+
+// ===== Dropbox Config & Checkpoint =====
+
+export const DropboxConfigSchema = z.object({
+  type: DROPBOX,
+  rootPath: z.string().optional(),
+  fileTypes: z.array(z.string()).optional(),
+  batchSize: z.number().optional(),
+  recursive: z.boolean().optional(),
+  maxDepth: z.number().optional(),
+});
+export type DropboxConfig = z.infer<typeof DropboxConfigSchema>;
+
+export const DropboxCheckpointSchema = z.object({
+  type: DROPBOX,
+  lastSyncedAt: z.string().optional(),
+  cursor: z.string().optional(),
+});
+export type DropboxCheckpoint = z.infer<typeof DropboxCheckpointSchema>;
+
+// ===== OneDrive Config & Checkpoint =====
+
+export const OneDriveConfigSchema = z.object({
+  type: ONEDRIVE,
+  tenantId: z.string().min(1),
+  userIds: z.array(z.string()).min(1, "At least one user ID is required"),
+  folderId: z.string().optional(),
+  recursive: z.boolean().optional(),
+  maxDepth: z.number().int().min(1).max(100).optional(),
+  fileTypes: z.array(z.string()).optional(),
+  batchSize: z.number().optional(),
+});
+export type OneDriveConfig = z.infer<typeof OneDriveConfigSchema>;
+
+export const OneDriveCheckpointSchema = z.object({
+  type: ONEDRIVE,
+  lastSyncedAt: z.string().optional(),
+});
+export type OneDriveCheckpoint = z.infer<typeof OneDriveCheckpointSchema>;
+
+// ===== Outline Config & Checkpoint =====
+
+export const OutlineConfigSchema = z.object({
+  type: OUTLINE,
+  outlineUrl: connectorUrlSchema,
+  collectionIds: z.array(z.string()).optional(),
+  batchSize: z.number().optional(),
+});
+export type OutlineConfig = z.infer<typeof OutlineConfigSchema>;
+
+export const OutlineCheckpointSchema = z.object({
+  type: OUTLINE,
+  syncStart: z.string().optional(),
+  lastCollectionId: z.string().optional(),
+  lastDocumentId: z.string().optional(),
+  lastSyncedAt: z.string().optional(),
+});
+export type OutlineCheckpoint = z.infer<typeof OutlineCheckpointSchema>;
 
 export const ConnectorConfigSchema = z.discriminatedUnion("type", [
   JiraConfigSchema,
@@ -227,6 +406,13 @@ export const ConnectorConfigSchema = z.discriminatedUnion("type", [
   NotionConfigSchema,
   SharePointConfigSchema,
   GoogleDriveConfigSchema,
+  FileUploadConfigSchema,
+  DropboxConfigSchema,
+  OneDriveConfigSchema,
+  AsanaConfigSchema,
+  LinearConfigSchema,
+  OutlineConfigSchema,
+  SalesforceConfigSchema,
 ]);
 export type ConnectorConfig = z.infer<typeof ConnectorConfigSchema>;
 
@@ -239,6 +425,13 @@ export const ConnectorCheckpointSchema = z.discriminatedUnion("type", [
   NotionCheckpointSchema,
   SharePointCheckpointSchema,
   GoogleDriveCheckpointSchema,
+  FileUploadCheckpointSchema,
+  DropboxCheckpointSchema,
+  OneDriveCheckpointSchema,
+  AsanaCheckpointSchema,
+  LinearCheckpointSchema,
+  OutlineCheckpointSchema,
+  SalesforceCheckpointSchema,
 ]);
 export type ConnectorCheckpoint = z.infer<typeof ConnectorCheckpointSchema>;
 
@@ -276,9 +469,16 @@ export interface ConnectorItemFailure {
   error: string;
 }
 
+export interface ConnectorItemSkipped {
+  itemId: string | number;
+  name: string;
+  reason: string;
+}
+
 export interface ConnectorSyncBatch {
   documents: ConnectorDocument[];
   failures?: ConnectorItemFailure[];
+  skipped?: ConnectorItemSkipped[];
   checkpoint: ConnectorCheckpoint;
   hasMore: boolean;
 }
@@ -311,6 +511,7 @@ export interface Connector {
     config: Record<string, unknown>;
     credentials: ConnectorCredentials;
     checkpoint: Record<string, unknown> | null;
+    embeddingInputModalities?: ModelInputModality[];
   }): Promise<number | null>;
 
   sync(params: {

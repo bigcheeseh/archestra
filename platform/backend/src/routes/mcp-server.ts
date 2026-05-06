@@ -2,7 +2,7 @@ import type { IncomingHttpHeaders } from "node:http";
 import { isPlaywrightCatalogItem, RouteId } from "@shared";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import { z } from "zod";
-import { hasPermission } from "@/auth";
+import { hasPermission, userHasPermission } from "@/auth";
 import mcpClient, {
   McpServerConnectionTimeoutError,
   McpServerNotReadyError,
@@ -11,6 +11,7 @@ import { McpServerRuntimeManager } from "@/k8s/mcp-server-runtime";
 import logger from "@/logging";
 import {
   AccountModel,
+  AgentModel,
   AgentToolModel,
   InternalMcpCatalogModel,
   McpServerModel,
@@ -18,7 +19,7 @@ import {
   ToolModel,
 } from "@/models";
 import { isByosEnabled, secretManager } from "@/secrets-manager";
-import { isMcpServerAssignableToTarget } from "@/services/agent-tool-assignment";
+import { filterMcpServersAssignableToTarget } from "@/services/agent-tool-assignment";
 import { refreshLinkedIdentityProviderAccessToken } from "@/services/identity-providers/access-token-refresh";
 import { exchangeEnterpriseManagedCredential } from "@/services/identity-providers/enterprise-managed/exchange";
 import {
@@ -34,9 +35,12 @@ import {
   InsertMcpServerSchema,
   type InternalMcpCatalogServerType,
   LocalMcpServerInstallationStatusSchema,
+  type ResourceVisibilityScope,
+  ResourceVisibilityScopeSchema,
   SelectMcpServerSchema,
   UuidIdSchema,
 } from "@/types";
+import { broadcastMcpInstallationStatus } from "@/websocket";
 
 const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
   fastify.get(
@@ -80,23 +84,10 @@ const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
           teamIds: assignmentTeamIds ?? [],
         };
 
-        allServers = (
-          await Promise.all(
-            allServers.map(async (server) =>
-              (await isMcpServerAssignableToTarget({
-                mcpServer: {
-                  ownerId: server.ownerId,
-                  teamId: server.teamId,
-                },
-                target,
-              }))
-                ? server
-                : null,
-            ),
-          )
-        ).filter(
-          (server): server is (typeof allServers)[number] => server != null,
-        );
+        allServers = await filterMcpServersAssignableToTarget({
+          mcpServers: allServers,
+          target,
+        });
       }
 
       return reply.send(allServers);
@@ -116,8 +107,16 @@ const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
         response: constructResponseSchema(SelectMcpServerSchema),
       },
     },
-    async ({ params: { id }, user }, reply) => {
-      const server = await McpServerModel.findById(id, user.id);
+    async ({ params: { id }, user, headers }, reply) => {
+      const { success: isMcpServerAdmin } = await hasPermission(
+        { mcpServerInstallation: ["admin"] },
+        headers,
+      );
+      const server = await McpServerModel.findById(
+        id,
+        user.id,
+        isMcpServerAdmin,
+      );
 
       if (!server) {
         throw new ApiError(404, "MCP server not found");
@@ -134,7 +133,10 @@ const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
         operationId: RouteId.InstallMcpServer,
         description: "Install an MCP server (from catalog or custom)",
         tags: ["MCP Server"],
-        body: InsertMcpServerSchema.omit({ serverType: true }).extend({
+        body: InsertMcpServerSchema.omit({
+          serverType: true,
+        }).extend({
+          scope: ResourceVisibilityScopeSchema.default("personal"),
           agentIds: z.array(UuidIdSchema).optional(),
           secretId: UuidIdSchema.optional(),
           // For PAT tokens (like GitHub), send the token directly
@@ -148,7 +150,7 @@ const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
         response: constructResponseSchema(SelectMcpServerSchema),
       },
     },
-    async ({ body, user, headers }, reply) => {
+    async ({ body, user, headers, organizationId }, reply) => {
       let {
         agentIds,
         secretId,
@@ -187,7 +189,7 @@ const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
         // Playwright browser preview can only be installed as a personal server
         if (
           isPlaywrightCatalogItem(serverData.catalogId) &&
-          serverData.teamId
+          serverData.scope !== "personal"
         ) {
           throw new ApiError(
             400,
@@ -198,45 +200,14 @@ const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
         // Set serverType from catalog item
         serverData.serverType = catalogItem.serverType;
 
-        // Validate permissions for team installations
-        // WHY: We want to restrict who can create team-wide MCP server installations:
-        // - Members should NOT be able to create team installations (they lack mcpServer:update)
-        // - Editors can create team installations ONLY for teams they are members of
-        // - Admins (with team:admin) can create team installations for ANY team
-        // This prevents members from installing MCP servers that affect the whole team.
-        if (serverData.teamId) {
-          const { success: hasTeamAdmin } = await hasPermission(
-            { team: ["admin"] },
-            headers,
-          );
-
-          if (!hasTeamAdmin) {
-            // WHY: mcpServer:update distinguishes editors from members
-            // Editors have this permission, members don't
-            const { success: hasMcpServerUpdate } = await hasPermission(
-              { mcpServerInstallation: ["update"] },
-              headers,
-            );
-
-            if (!hasMcpServerUpdate) {
-              throw new ApiError(
-                403,
-                "You don't have permission to create team MCP server installations",
-              );
-            }
-
-            const isMember = await TeamModel.isUserInTeam(
-              serverData.teamId,
-              user.id,
-            );
-            if (!isMember) {
-              throw new ApiError(
-                403,
-                "You can only create MCP server installations for teams you are a member of",
-              );
-            }
-          }
-        }
+        // Scope-based authorization (personal / team / org).
+        await validateScopeAndAuthorization({
+          scope: serverData.scope,
+          teamId: serverData.teamId,
+          userId: user.id,
+          organizationId,
+          headers,
+        });
 
         // Validate no duplicate installations for this catalog item
         const existingServers = await McpServerModel.findByCatalogId(
@@ -245,36 +216,54 @@ const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
 
         // Check for duplicate personal installation (same user, no team)
         // Return existing server instead of erroring (idempotent behavior)
-        if (!serverData.teamId) {
+        if (serverData.scope === "personal") {
           const existingPersonal = existingServers.find(
-            (s) => s.ownerId === user.id && !s.teamId,
+            (s) => s.scope === "personal" && s.ownerId === user.id,
           );
           if (existingPersonal) {
-            // If agentIds provided, assign the server's tools to those agents
-            if (agentIds && agentIds.length > 0) {
-              const catalogTools = await ToolModel.findByCatalogId(
-                serverData.catalogId,
+            const catalogTools = await ToolModel.findByCatalogId(
+              serverData.catalogId,
+            );
+            const toolIds = catalogTools.map((t) => t.id);
+            if (toolIds.length > 0) {
+              const personalGateway = await AgentModel.ensurePersonalMcpGateway(
+                {
+                  userId: user.id,
+                  organizationId,
+                },
               );
-              const toolIds = catalogTools.map((t) => t.id);
-              if (toolIds.length > 0) {
-                for (const agentId of agentIds) {
-                  await AgentToolModel.createManyIfNotExists(agentId, toolIds);
-                }
-              }
+              const targetAgentIds = Array.from(
+                new Set([personalGateway.id, ...(agentIds ?? [])]),
+              );
+              await AgentToolModel.bulkCreateForAgentsAndTools(
+                targetAgentIds,
+                toolIds,
+                { mcpServerId: existingPersonal.id },
+              );
             }
             return reply.send(existingPersonal);
           }
         }
 
         // Check for duplicate team installation (same team)
-        if (serverData.teamId) {
+        if (serverData.scope === "team") {
           const existingTeam = existingServers.find(
-            (s) => s.teamId === serverData.teamId,
+            (s) => s.scope === "team" && s.teamId === serverData.teamId,
           );
           if (existingTeam) {
             throw new ApiError(
               400,
               "This team already has an installation of this MCP server",
+            );
+          }
+        }
+
+        if (serverData.scope === "org") {
+          const existingOrg = existingServers.find((s) => s.scope === "org");
+          if (existingOrg) {
+            throw new ApiError(
+              400,
+              "This organization already has an installation of this MCP server",
             );
           }
         }
@@ -634,6 +623,7 @@ const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
               localInstallationStatus: "pending",
               localInstallationError: null,
             });
+            broadcastMcpInstallationStatus(mcpServer.id, "pending", null);
 
             await McpServerRuntimeManager.startServer(
               mcpServer,
@@ -677,6 +667,11 @@ const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
                   localInstallationStatus: "discovering-tools",
                   localInstallationError: null,
                 });
+                broadcastMcpInstallationStatus(
+                  mcpServer.id,
+                  "discovering-tools",
+                  null,
+                );
 
                 fastify.log.info(
                   `Attempting to fetch tools from local server: ${mcpServer.name}`,
@@ -699,16 +694,33 @@ const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
                 const createdTools =
                   await ToolModel.bulkCreateToolsIfNotExists(toolsToCreate);
 
-                // If agentIds were provided, create agent-tool assignments pinned to this installation.
-                if (agentIds && agentIds.length > 0) {
+                // For personal installs, auto-assign every discovered tool to the
+                // installer's personal gateway alongside any explicit agentIds.
+                // Team-scoped installs only honor explicit agentIds.
+                {
                   const toolIds = createdTools.map((t) => t.id);
-                  await AgentToolModel.bulkCreateForAgentsAndTools(
-                    agentIds,
-                    toolIds,
-                    {
-                      mcpServerId: mcpServer.id,
-                    },
-                  );
+                  if (toolIds.length > 0) {
+                    const targetAgentIds: string[] = [];
+                    if (!mcpServer.teamId) {
+                      const personalGateway =
+                        await AgentModel.ensurePersonalMcpGateway({
+                          userId: user.id,
+                          organizationId,
+                        });
+                      targetAgentIds.push(personalGateway.id);
+                    }
+                    if (agentIds && agentIds.length > 0) {
+                      targetAgentIds.push(...agentIds);
+                    }
+                    const dedupedAgentIds = Array.from(new Set(targetAgentIds));
+                    if (dedupedAgentIds.length > 0) {
+                      await AgentToolModel.bulkCreateForAgentsAndTools(
+                        dedupedAgentIds,
+                        toolIds,
+                        { mcpServerId: mcpServer.id },
+                      );
+                    }
+                  }
                 }
 
                 // Set status to success after tools are fetched
@@ -716,6 +728,7 @@ const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
                   localInstallationStatus: "success",
                   localInstallationError: null,
                 });
+                broadcastMcpInstallationStatus(mcpServer.id, "success", null);
 
                 fastify.log.info(
                   `Successfully fetched and persisted ${tools.length} tools from local server: ${mcpServer.name}`,
@@ -734,6 +747,11 @@ const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
                   localInstallationStatus: "error",
                   localInstallationError: errorMessage,
                 });
+                broadcastMcpInstallationStatus(
+                  mcpServer.id,
+                  "error",
+                  errorMessage,
+                );
               }
             })();
 
@@ -755,6 +773,11 @@ const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
               localInstallationStatus: "error",
               localInstallationError: `Failed to start deployment: ${errorMessage}`,
             });
+            broadcastMcpInstallationStatus(
+              mcpServer.id,
+              "error",
+              `Failed to start deployment: ${errorMessage}`,
+            );
 
             // Return the server with error status instead of throwing 500
             return reply.send({
@@ -778,7 +801,7 @@ const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
           mcpServerId: mcpServer.id,
           secretId: mcpServer.secretId ?? undefined,
           userId: user.id,
-          allowCurrentUserTokenFallback: !mcpServer.teamId,
+          allowCurrentUserTokenFallback: mcpServer.scope === "personal",
         });
 
         // Persist tools in the database with source='mcp_server' and mcpServerId
@@ -795,12 +818,34 @@ const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
         const createdTools =
           await ToolModel.bulkCreateToolsIfNotExists(toolsToCreate);
 
-        // If agentIds were provided, create agent-tool assignments pinned to this installation.
-        if (agentIds && agentIds.length > 0) {
+        // For personal installs, auto-assign every discovered tool to the
+        // installer's personal gateway alongside any explicit agentIds.
+        // Team-scoped installs only honor explicit agentIds.
+        {
           const toolIds = createdTools.map((t) => t.id);
-          await AgentToolModel.bulkCreateForAgentsAndTools(agentIds, toolIds, {
-            mcpServerId: mcpServer.id,
-          });
+          if (toolIds.length > 0) {
+            const targetAgentIds: string[] = [];
+            if (!mcpServer.teamId) {
+              const personalGateway = await AgentModel.ensurePersonalMcpGateway(
+                {
+                  userId: user.id,
+                  organizationId,
+                },
+              );
+              targetAgentIds.push(personalGateway.id);
+            }
+            if (agentIds && agentIds.length > 0) {
+              targetAgentIds.push(...agentIds);
+            }
+            const dedupedAgentIds = Array.from(new Set(targetAgentIds));
+            if (dedupedAgentIds.length > 0) {
+              await AgentToolModel.bulkCreateForAgentsAndTools(
+                dedupedAgentIds,
+                toolIds,
+                { mcpServerId: mcpServer.id },
+              );
+            }
+          }
         }
 
         // Set status to success for non-local servers
@@ -808,6 +853,7 @@ const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
           localInstallationStatus: "success",
           localInstallationError: null,
         });
+        broadcastMcpInstallationStatus(mcpServer.id, "success", null);
 
         return reply.send({
           ...mcpServer,
@@ -882,7 +928,7 @@ const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
       }
 
       // Get the existing MCP server
-      const mcpServer = await McpServerModel.findById(id, user.id);
+      const mcpServer = await McpServerModel.findById(id);
 
       if (!mcpServer) {
         throw new ApiError(404, "MCP server not found");
@@ -900,52 +946,13 @@ const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
         );
       }
 
-      // For personal credentials, only owner can re-authenticate
-      if (!mcpServer.teamId) {
-        if (mcpServer.ownerId !== user.id) {
-          throw new ApiError(
-            403,
-            "Only the credential owner can re-authenticate",
-          );
-        }
-      } else {
-        // For team credentials: user must have team:admin OR (mcpServer:update AND team membership)
-        // WHY: This matches the team installation permission requirements - only editors and admins
-        // can manage team credentials, members cannot.
-        // Same rules apply for re-authentication.
-        const { success: isTeamAdmin } = await hasPermission(
-          { team: ["admin"] },
-          headers,
-        );
-
-        if (!isTeamAdmin) {
-          // WHY: mcpServer:update distinguishes editors from members
-          // Editors have this permission, members don't
-          const { success: hasMcpServerUpdate } = await hasPermission(
-            { mcpServerInstallation: ["update"] },
-            headers,
-          );
-
-          if (!hasMcpServerUpdate) {
-            throw new ApiError(
-              403,
-              "You don't have permission to re-authenticate team credentials",
-            );
-          }
-
-          // WHY: Even editors can only re-authenticate for their own teams
-          const isMember = await TeamModel.isUserInTeam(
-            mcpServer.teamId,
-            user.id,
-          );
-          if (!isMember) {
-            throw new ApiError(
-              403,
-              "You can only re-authenticate credentials for teams you are a member of",
-            );
-          }
-        }
-      }
+      // Scope-aware lifecycle authorization.
+      await assertScopedLifecycleAuthorization({
+        mcpServer,
+        userId: user.id,
+        headers,
+        action: "re-authenticate",
+      });
 
       // Resolve the new secret ID: either provided directly, or create from raw credentials
       let newSecretId = providedSecretId;
@@ -1004,7 +1011,7 @@ const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
                 mcpServerId: "validation",
                 secretId: newSecretId,
                 userId: user.id,
-                allowCurrentUserTokenFallback: !mcpServer.teamId,
+                allowCurrentUserTokenFallback: mcpServer.scope === "personal",
               });
             } catch (error) {
               // Clean up the newly created secret
@@ -1181,53 +1188,12 @@ const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
         throw new ApiError(400, "Cannot delete built-in MCP servers");
       }
 
-      // Authorization: check if user can delete this server
-      if (!mcpServer.teamId) {
-        // Personal server: owner OR mcpServer:update permission
-        if (mcpServer.ownerId !== user.id) {
-          const { success: hasMcpServerUpdate } = await hasPermission(
-            { mcpServerInstallation: ["update"] },
-            headers,
-          );
-          if (!hasMcpServerUpdate) {
-            throw new ApiError(
-              403,
-              "Only the connection owner or an editor/admin can revoke personal connections",
-            );
-          }
-        }
-      } else {
-        // Team server: team:admin OR (mcpServer:update AND team membership)
-        const { success: isTeamAdmin } = await hasPermission(
-          { team: ["admin"] },
-          headers,
-        );
-
-        if (!isTeamAdmin) {
-          const { success: hasMcpServerUpdate } = await hasPermission(
-            { mcpServerInstallation: ["update"] },
-            headers,
-          );
-
-          if (!hasMcpServerUpdate) {
-            throw new ApiError(
-              403,
-              "You don't have permission to revoke team connections",
-            );
-          }
-
-          const isMember = await TeamModel.isUserInTeam(
-            mcpServer.teamId,
-            user.id,
-          );
-          if (!isMember) {
-            throw new ApiError(
-              403,
-              "You can only revoke connections for teams you are a member of",
-            );
-          }
-        }
-      }
+      await assertScopedLifecycleAuthorization({
+        mcpServer,
+        userId: user.id,
+        headers,
+        action: "revoke",
+      });
 
       // For local servers, stop the server (this will delete the K8s Secret)
       if (mcpServer.serverType === "local") {
@@ -1480,58 +1446,18 @@ const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
       } = body;
 
       // Get the existing MCP server
-      const mcpServer = await McpServerModel.findById(id, user.id);
+      const mcpServer = await McpServerModel.findById(id);
 
       if (!mcpServer) {
         throw new ApiError(404, "MCP server not found");
       }
 
-      // Check permissions for reinstall (same logic as re-authenticate)
-      // For personal servers, only owner can reinstall
-      if (!mcpServer.teamId) {
-        if (mcpServer.ownerId !== user.id) {
-          throw new ApiError(
-            403,
-            "Only the server owner can reinstall this MCP server",
-          );
-        }
-      } else {
-        // For team servers: user must have team:admin OR (mcpServer:update AND team membership)
-        // WHY: This matches the team installation permission requirements - only editors and admins
-        // can manage team servers, members cannot.
-        const { success: isTeamAdmin } = await hasPermission(
-          { team: ["admin"] },
-          headers,
-        );
-
-        if (!isTeamAdmin) {
-          // WHY: mcpServer:update distinguishes editors from members
-          // Editors have this permission, members don't
-          const { success: hasMcpServerUpdate } = await hasPermission(
-            { mcpServerInstallation: ["update"] },
-            headers,
-          );
-
-          if (!hasMcpServerUpdate) {
-            throw new ApiError(
-              403,
-              "You don't have permission to reinstall team MCP servers",
-            );
-          }
-
-          // WHY: Even editors can only reinstall servers for their own teams
-          const isMember = await TeamModel.isUserInTeam(
-            mcpServer.teamId,
-            user.id,
-          );
-          if (!isMember) {
-            throw new ApiError(
-              403,
-              "You can only reinstall MCP servers for teams you are a member of",
-            );
-          }
-        }
-      }
+      await assertScopedLifecycleAuthorization({
+        mcpServer,
+        userId: user.id,
+        headers,
+        action: "reinstall",
+      });
 
       // Get catalog item
       const catalogItem = mcpServer.catalogId
@@ -1687,6 +1613,7 @@ const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
         localInstallationStatus: "pending",
         localInstallationError: null,
       });
+      broadcastMcpInstallationStatus(id, "pending", null);
 
       // Refetch the server with updated status
       const updatedServer = await McpServerModel.findById(id);
@@ -1709,7 +1636,8 @@ const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
                         mcpServerId: server.id,
                         secretId: server.secretId ?? undefined,
                         userId: user.id,
-                        allowCurrentUserTokenFallback: true,
+                        allowCurrentUserTokenFallback:
+                          updatedServer.scope === "personal",
                       })
                     ).map((tool) => ({
                       name: tool.name,
@@ -1724,17 +1652,20 @@ const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
           await McpServerModel.update(id, {
             localInstallationStatus: "success",
           });
+          broadcastMcpInstallationStatus(id, "success", null);
           logger.info(
             { serverId: id, serverName: mcpServer.name },
             "MCP server reinstalled successfully",
           );
         } catch (error) {
           // Set status to error if reinstall fails
+          const errorMessage =
+            error instanceof Error ? error.message : "Unknown error";
           await McpServerModel.update(id, {
             localInstallationStatus: "error",
-            localInstallationError:
-              error instanceof Error ? error.message : "Unknown error",
+            localInstallationError: errorMessage,
           });
+          broadcastMcpInstallationStatus(id, "error", errorMessage);
           logger.error(
             { err: error, serverId: id },
             "Failed to reinstall MCP server",
@@ -1770,6 +1701,92 @@ async function findAccessibleMcpServer(params: {
 // =============================================================================
 // Internal helpers
 // =============================================================================
+
+/**
+ * Gate the three destructive lifecycle actions (revoke / reauth / reinstall)
+ * on an already-fetched MCP server by its scope. Rules:
+ *   - personal:
+ *       - revoke: owner OR mcpServerInstallation:update
+ *       - re-authenticate / reinstall: owner only (these replace the
+ *         connection's secret, so they must not be available to editors)
+ *   - team:     team:admin OR (mcpServerInstallation:update AND user-in-team)
+ *   - org:      mcpServerInstallation:admin (no owner fallback)
+ */
+async function assertScopedLifecycleAuthorization(params: {
+  mcpServer: {
+    scope: "personal" | "team" | "org";
+    ownerId: string | null;
+    teamId: string | null;
+  };
+  userId: string;
+  headers: IncomingHttpHeaders;
+  action: "revoke" | "re-authenticate" | "reinstall";
+}): Promise<void> {
+  const { mcpServer, userId, headers, action } = params;
+
+  switch (mcpServer.scope) {
+    case "personal": {
+      if (mcpServer.ownerId === userId) return;
+      if (action === "revoke") {
+        const { success: hasMcpServerUpdate } = await hasPermission(
+          { mcpServerInstallation: ["update"] },
+          headers,
+        );
+        if (hasMcpServerUpdate) return;
+        throw new ApiError(
+          403,
+          `Only the connection owner or an editor/admin can ${action} personal connections`,
+        );
+      }
+      throw new ApiError(
+        403,
+        `Only the connection owner can ${action} personal connections`,
+      );
+    }
+    case "team": {
+      if (!mcpServer.teamId) {
+        throw new ApiError(500, "Team-scoped MCP server is missing its teamId");
+      }
+      const { success: isTeamAdmin } = await hasPermission(
+        { team: ["admin"] },
+        headers,
+      );
+      if (isTeamAdmin) return;
+
+      const { success: hasMcpServerUpdate } = await hasPermission(
+        { mcpServerInstallation: ["update"] },
+        headers,
+      );
+      if (!hasMcpServerUpdate) {
+        throw new ApiError(
+          403,
+          `You don't have permission to ${action} team connections`,
+        );
+      }
+      const isMember = await TeamModel.isUserInTeam(mcpServer.teamId, userId);
+      if (!isMember) {
+        throw new ApiError(
+          403,
+          `You can only ${action} connections for teams you are a member of`,
+        );
+      }
+      return;
+    }
+    case "org": {
+      const { success: isMcpServerInstallationAdmin } = await hasPermission(
+        { mcpServerInstallation: ["admin"] },
+        headers,
+      );
+      if (!isMcpServerInstallationAdmin) {
+        throw new ApiError(
+          403,
+          `Only mcpServerInstallation admins can ${action} organization-scoped connections`,
+        );
+      }
+      return;
+    }
+  }
+}
 
 async function connectAndGetToolsForInstallation(params: {
   catalogItem: Awaited<ReturnType<typeof InternalMcpCatalogModel.findById>>;
@@ -2050,4 +2067,82 @@ function filterInstallUserConfigValues(params: {
   }
 
   return Object.fromEntries(filteredEntries);
+}
+
+async function validateScopeAndAuthorization(params: {
+  scope: ResourceVisibilityScope;
+  teamId: string | null | undefined;
+  userId: string;
+  organizationId: string;
+  headers: IncomingHttpHeaders;
+}): Promise<void> {
+  const { scope, teamId, userId, organizationId, headers } = params;
+
+  if (scope === "team" && !teamId) {
+    throw new ApiError(
+      400,
+      "teamId is required for team-scoped MCP server installations",
+    );
+  }
+
+  if (scope === "personal" && teamId) {
+    throw new ApiError(
+      400,
+      "teamId should not be provided for personal-scoped MCP server installations",
+    );
+  }
+
+  if (scope === "org" && teamId) {
+    throw new ApiError(
+      400,
+      "teamId should not be provided for organization-scoped MCP server installations",
+    );
+  }
+
+  if (scope === "team" && teamId) {
+    const team = await TeamModel.findById(teamId);
+    if (!team) {
+      throw new ApiError(404, "Team not found");
+    }
+
+    const { success: hasTeamAdmin } = await hasPermission(
+      { team: ["admin"] },
+      headers,
+    );
+
+    if (!hasTeamAdmin) {
+      const { success: hasMcpServerUpdate } = await hasPermission(
+        { mcpServerInstallation: ["update"] },
+        headers,
+      );
+      if (!hasMcpServerUpdate) {
+        throw new ApiError(
+          403,
+          "You don't have permission to create team MCP server installations",
+        );
+      }
+      const isMember = await TeamModel.isUserInTeam(teamId, userId);
+      if (!isMember) {
+        throw new ApiError(
+          403,
+          "You can only create MCP server installations for teams you are a member of",
+        );
+      }
+    }
+  }
+
+  if (scope === "org") {
+    const isMcpServerInstallationAdmin = await userHasPermission(
+      userId,
+      organizationId,
+      "mcpServerInstallation",
+      "admin",
+    );
+    if (!isMcpServerInstallationAdmin) {
+      throw new ApiError(
+        403,
+        "Only mcpServerInstallation admins can install organization-scoped MCP servers",
+      );
+    }
+  }
 }

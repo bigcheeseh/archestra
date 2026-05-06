@@ -8,6 +8,7 @@
 import { context as otelContext } from "@opentelemetry/api";
 import {
   ApiError,
+  type ArchestraInternalErrorCode,
   type InteractionSource,
   type SupportedProvider,
   type SupportedProviderDiscriminator,
@@ -21,6 +22,7 @@ import type {
   Agent,
   DualLlmAnalysis,
   InsertInteraction,
+  InteractionAuthMethod,
   InteractionRequest,
   InteractionResponse,
   ToolCompressionStats,
@@ -100,6 +102,12 @@ export async function calculateInteractionCosts(params: {
 export function buildInteractionRecord(params: {
   agent: Agent;
   externalAgentId?: string;
+  authMethod?: InteractionAuthMethod;
+  authenticatedApp?: {
+    id: string;
+    name: string;
+    clientId: string;
+  };
   executionId?: string;
   userId?: string;
   sessionId?: string | null;
@@ -121,6 +129,9 @@ export function buildInteractionRecord(params: {
   return {
     profileId: params.agent.id,
     externalAgentId: params.externalAgentId,
+    authMethod: params.authMethod,
+    authenticatedAppId: params.authenticatedApp?.id,
+    authenticatedAppName: params.authenticatedApp?.name,
     executionId: params.executionId,
     userId: params.userId,
     sessionId: params.sessionId,
@@ -202,6 +213,9 @@ export function handleError(
   reply: FastifyReply,
   extractErrorMessage: (error: unknown) => string,
   isStreaming: boolean,
+  extractInternalCode: (
+    error: unknown,
+  ) => ArchestraInternalErrorCode | undefined,
 ): FastifyReply | never {
   logger.error(error);
 
@@ -221,6 +235,7 @@ export function handleError(
   }
 
   const errorMessage = extractErrorMessage(error);
+  const internalCode = extractInternalCode(error);
 
   // If headers already sent (mid-stream error), write error to stream.
   // Clients (like AI SDK) detect errors via HTTP status code, but we can't change
@@ -250,5 +265,5 @@ export function handleError(
 
   // Headers not sent yet - throw ApiError to let central handler return proper status code
   // This matches V1 handler behavior and ensures clients receive correct HTTP status
-  throw new ApiError(statusCode, errorMessage);
+  throw new ApiError(statusCode, errorMessage, internalCode);
 }

@@ -1,6 +1,11 @@
 import AnthropicProvider from "@anthropic-ai/sdk";
+import { ArchestraInternalErrorCode } from "@shared";
 import { encode as toonEncode } from "@toon-format/toon";
 import { get } from "lodash-es";
+import {
+  getAzureAiFoundryBearerTokenProvider,
+  isAnthropicAzureFoundryEntraIdEnabled,
+} from "@/clients/azure-openai-credentials";
 import config from "@/config";
 import logger from "@/logging";
 import { ModelModel } from "@/models";
@@ -1153,6 +1158,20 @@ export const anthropicAdapterFactory: LLMProvider<
     const token = isAuthToken && apiKey ? apiKey.slice(7) : undefined;
     const regularApiKey = isAuthToken ? undefined : apiKey;
 
+    if (!apiKey && isAnthropicAzureFoundryEntraIdEnabled()) {
+      return new AnthropicProvider({
+        apiKey: null,
+        authToken: null,
+        baseURL: options.baseUrl,
+        fetch: createAnthropicAzureFoundryFetch(customFetch),
+        defaultHeaders: {
+          ...options.defaultHeaders,
+          // The fetch wrapper replaces this sentinel with a fresh Entra ID token on every request.
+          Authorization: "Bearer <entra-id-managed>",
+        },
+      });
+    }
+
     return new AnthropicProvider({
       apiKey: regularApiKey,
       authToken: token,
@@ -1192,6 +1211,22 @@ export const anthropicAdapterFactory: LLMProvider<
     };
   },
 
+  extractInternalCode(error: unknown): ArchestraInternalErrorCode | undefined {
+    // Anthropic returns 400 invalid_request_error when the prompt exceeds
+    // the model's context window, with a message like "prompt is too long:
+    // X tokens > Y maximum". There is no structured code — message sniffing
+    // is the only signal.
+    const message: unknown =
+      get(error, "error.error.message") ?? get(error, "error.message");
+    if (
+      typeof message === "string" &&
+      message.toLowerCase().includes("prompt is too long")
+    ) {
+      return ArchestraInternalErrorCode.ContextLengthExceeded;
+    }
+    return undefined;
+  },
+
   extractErrorMessage(error: unknown): string {
     // Anthropic SDK wraps errors as: { error: { error: { message: "..." } } }
     const anthropicMessage = get(error, "error.error.message");
@@ -1206,3 +1241,19 @@ export const anthropicAdapterFactory: LLMProvider<
     return "Internal server error";
   },
 };
+
+function createAnthropicAzureFoundryFetch(
+  baseFetch: typeof globalThis.fetch | undefined,
+): typeof globalThis.fetch {
+  return async (input, init) => {
+    const tokenProvider = getAzureAiFoundryBearerTokenProvider();
+    const headers = new Headers(init?.headers);
+    headers.set("Authorization", `Bearer ${await tokenProvider()}`);
+
+    const fetchFn = baseFetch ?? globalThis.fetch;
+    return fetchFn(input, {
+      ...init,
+      headers,
+    });
+  };
+}

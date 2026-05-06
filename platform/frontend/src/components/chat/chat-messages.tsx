@@ -16,6 +16,7 @@ import {
 } from "@shared";
 import type { ChatStatus, DynamicToolUIPart, ToolUIPart } from "ai";
 import { BotIcon, CheckCircleIcon, ClockIcon } from "lucide-react";
+import Link from "next/link";
 import {
   Fragment,
   memo,
@@ -26,6 +27,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { useStickToBottomContext } from "use-stick-to-bottom";
 import {
   Conversation,
   ConversationContent,
@@ -71,7 +73,10 @@ import {
   resolveToolAuthState,
 } from "@/lib/chat/mcp-error-ui";
 import { hasThinkingTags, parseThinkingTags } from "@/lib/chat/parse-thinking";
-import { getSwapToolShortName } from "@/lib/chat/swap-agent.utils";
+import {
+  getSwapToolShortName,
+  type SwapToolPart,
+} from "@/lib/chat/swap-agent.utils";
 import type { ModelSource } from "@/lib/chat/use-chat-preferences";
 import { useAppIconLogo } from "@/lib/hooks/use-app-name";
 import { useArchestraMcpIdentity } from "@/lib/mcp/archestra-mcp-server";
@@ -103,7 +108,10 @@ import {
   UnsafeContextStartsHereDivider,
 } from "./message-boundary-divider";
 import { PolicyDeniedTool } from "./policy-denied-tool";
-import { SwapAgentBoundaryDivider } from "./swap-agent-boundary";
+import {
+  getSwapAgentBoundaryLabel,
+  SwapAgentBoundaryDivider,
+} from "./swap-agent-boundary";
 import { TodoWriteTool } from "./todo-write-tool";
 import { ToolErrorLogsButton } from "./tool-error-logs-button";
 import { ToolStatusRow } from "./tool-status-row";
@@ -126,6 +134,7 @@ interface ChatMessagesProps {
     editedPartIndex: number,
   ) => void;
   error?: Error | null;
+  chatErrors?: archestraApiTypes.GetChatConversationResponses["200"]["chatErrors"];
   /** Callback for tool approval responses (approve/deny) */
   onToolApprovalResponse?: (params: {
     id: string;
@@ -137,6 +146,13 @@ interface ChatMessagesProps {
   modelSource?: ModelSource | null;
   unsafeContextBoundary?: archestraApiTypes.GetInteractionResponses["200"]["unsafeContextBoundary"];
 }
+
+type PersistedChatError =
+  archestraApiTypes.GetChatConversationResponses["200"]["chatErrors"][number];
+
+type TimelineItem =
+  | { kind: "message"; message: UIMessage; messageIndex: number }
+  | { kind: "chat-error"; chatError: PersistedChatError };
 
 // Type guards for tool parts
 // biome-ignore lint/suspicious/noExplicitAny: AI SDK message parts have dynamic structure
@@ -170,6 +186,7 @@ export function ChatMessages({
   onMessagesUpdate,
   onUserMessageEdit,
   error = null,
+  chatErrors = [],
   onToolApprovalResponse,
   agentName,
   selectedModel,
@@ -378,16 +395,12 @@ export function ChatMessages({
     };
   });
 
-  // Only auto-scroll on content resize during streaming.
-  // When idle, user interactions like expanding tool calls should not
-  // trigger scroll — returning the current scrollTop keeps position stable.
-  const preventResizeScroll = useCallback(
-    (_target: number, { scrollElement }: { scrollElement: HTMLElement }) =>
-      scrollElement.scrollTop,
-    [],
+  const assistantMessageCount = useMemo(
+    () => messages.filter((m) => m.role === "assistant").length,
+    [messages],
   );
 
-  if (messages.length === 0) {
+  if (messages.length === 0 && chatErrors.length === 0) {
     // Don't show "start conversation" message while loading - prevents flash of empty state
     if (isLoadingConversation) {
       return null;
@@ -418,13 +431,20 @@ export function ChatMessages({
     const nextMessage = messages[idx + 1];
     return nextMessage.role !== "assistant";
   });
+  const timelineItems = buildMessageTimeline({ messages, chatErrors });
+  const liveErrorMessage = error ? getInlineErrorMessage(error) : null;
+  const hasRenderedLiveError =
+    !!error &&
+    chatErrors.some(
+      (chatError) => chatError.error.message === liveErrorMessage,
+    );
 
   return (
     <Conversation
       className="h-full"
       resize={instantResize || initialLoad ? "instant" : "smooth"}
-      targetScrollTop={isResponseInProgress ? undefined : preventResizeScroll}
     >
+      <ScrollToBottomOnSubmit status={status} />
       <ConversationContent>
         <div className="max-w-4xl mx-auto relative pb-8">
           <SensitiveContextStickyIndicator
@@ -433,12 +453,37 @@ export function ChatMessages({
           {unsafeContextBoundary?.kind === "preexisting_untrusted" && (
             <PreexistingUnsafeContextDivider dividerRef={unsafeBoundaryRef} />
           )}
-          {messages.map((message, idx) => {
+          {timelineItems.map((item) => {
+            if (item.kind === "chat-error") {
+              return (
+                <InlineChatError
+                  key={`chat-error-${item.chatError.id}`}
+                  error={new Error(JSON.stringify(item.chatError.error))}
+                  conversationId={conversationId}
+                  supportMessage={organization?.chatErrorSupportMessage}
+                  slimChatErrorUi={organization?.slimChatErrorUi ?? false}
+                  agentName={agentName}
+                  selectedModel={selectedModel}
+                  modelSource={modelSource}
+                />
+              );
+            }
+
+            const { message, messageIndex: idx } = item;
             // Hide the auto-poke message sent after agent swap
             if (!isDebugging && isSwapAgentPokeMessage(message)) return null;
 
             const isDimmed =
               editingMessageIndex !== -1 && idx > editingMessageIndex;
+            const previousSwapBoundaryLabel =
+              message.role === "assistant"
+                ? getPreviousAssistantSwapBoundaryLabel({
+                    messages,
+                    beforeIndex: idx,
+                    getToolShortName,
+                    hasToolError: hasSwapToolError,
+                  })
+                : null;
 
             return (
               <div
@@ -863,7 +908,13 @@ export function ChatMessages({
                                 </video>
                               )}
                               {isPdf && (
-                                <div className="flex items-center gap-2 text-sm rounded-lg border bg-muted/50 p-2">
+                                <Link
+                                  href={filePart.url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  download={filePart.filename}
+                                  className="flex items-center gap-2 text-sm rounded-lg border bg-muted/50 p-2 hover:bg-muted transition-colors"
+                                >
                                   <svg
                                     className="h-6 w-6 text-red-500"
                                     fill="currentColor"
@@ -875,10 +926,16 @@ export function ChatMessages({
                                   <span className="font-medium truncate">
                                     {filePart.filename || "PDF Document"}
                                   </span>
-                                </div>
+                                </Link>
                               )}
                               {!isImage && !isVideo && !isPdf && (
-                                <div className="flex items-center gap-2 text-sm rounded-lg border bg-muted/50 p-2">
+                                <a
+                                  href={filePart.url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  download={filePart.filename}
+                                  className="flex items-center gap-2 text-sm rounded-lg border bg-muted/50 p-2 hover:bg-muted transition-colors"
+                                >
                                   <svg
                                     className="h-5 w-5 text-muted-foreground"
                                     fill="none"
@@ -896,7 +953,7 @@ export function ChatMessages({
                                   <span className="truncate">
                                     {filePart.filename || "Attached file"}
                                   </span>
-                                </div>
+                                </a>
                               )}
                             </div>
                           </div>
@@ -953,6 +1010,9 @@ export function ChatMessages({
                                 session?.sendMessage({
                                   role: "user",
                                   parts: [{ type: "text", text }],
+                                  metadata: {
+                                    createdAt: new Date().toISOString(),
+                                  },
                                 })
                               }
                             />
@@ -1033,6 +1093,9 @@ export function ChatMessages({
                                   session?.sendMessage({
                                     role: "user",
                                     parts: [{ type: "text", text }],
+                                    metadata: {
+                                      createdAt: new Date().toISOString(),
+                                    },
                                   })
                                 }
                                 earlyToolUiData={earlyToolUiStarts[tcId]}
@@ -1105,6 +1168,9 @@ export function ChatMessages({
                                   session?.sendMessage({
                                     role: "user",
                                     parts: [{ type: "text", text }],
+                                    metadata: {
+                                      createdAt: new Date().toISOString(),
+                                    },
                                   })
                                 }
                               />
@@ -1123,13 +1189,14 @@ export function ChatMessages({
                     parts={message.parts ?? []}
                     getToolShortName={getToolShortName}
                     hasToolError={hasSwapToolError}
+                    suppressLabel={previousSwapBoundaryLabel}
                   />
                 )}
               </div>
             );
           })}
           {/* Inline error display */}
-          {error && (
+          {error && !hasRenderedLiveError && (
             <InlineChatError
               error={error}
               conversationId={conversationId}
@@ -1176,7 +1243,7 @@ export function ChatMessages({
           )}
         </div>
       </ConversationContent>
-      <ConversationScrollButton />
+      <ChatScrollButton assistantMessageCount={assistantMessageCount} />
       <McpInstallDialogs orchestrator={orchestrator} />
     </Conversation>
   );
@@ -1261,6 +1328,50 @@ function useStreamingStallDetection(
   }, [status]);
 
   return isStreamingStalled;
+}
+
+// Re-engage stick-to-bottom when the user sends a new message.
+// If the user has scrolled up, the library keeps state.isAtBottom=false and
+// won't auto-scroll on content resize — this resets it on the submit transition.
+function ScrollToBottomOnSubmit({ status }: { status: ChatStatus }) {
+  const { scrollToBottom } = useStickToBottomContext();
+  const prevStatusRef = useRef(status);
+
+  useEffect(() => {
+    if (status === "submitted" && prevStatusRef.current !== "submitted") {
+      scrollToBottom();
+    }
+
+    prevStatusRef.current = status;
+  }, [status, scrollToBottom]);
+
+  return null;
+}
+
+// Scroll-to-bottom FAB with a "New messages" label when a new assistant
+// message has arrived while the user is scrolled up.
+function ChatScrollButton({
+  assistantMessageCount,
+}: {
+  assistantMessageCount: number;
+}) {
+  const { isAtBottom } = useStickToBottomContext();
+  const lastSeenCountRef = useRef(assistantMessageCount);
+
+  useEffect(() => {
+    if (isAtBottom) {
+      lastSeenCountRef.current = assistantMessageCount;
+    }
+  }, [isAtBottom, assistantMessageCount]);
+
+  const hasNewMessages =
+    !isAtBottom && assistantMessageCount > lastSeenCountRef.current;
+
+  return (
+    <ConversationScrollButton
+      label={hasNewMessages ? "New messages" : undefined}
+    />
+  );
 }
 
 const MessageTool = memo(
@@ -1378,18 +1489,33 @@ const MessageTool = memo(
       onReauthMcp,
     });
 
-    // swap_agent / swap_to_default_agent are rendered as dividers after all message parts (see SwapAgentDivider below)
-    // Show the raw tool call when the user's name ends with "(debugging)"
+    // Successful swap_agent / swap_to_default_agent calls are rendered as dividers after all message parts.
+    // Failed/no-op swap calls use the compact tool status indicator so they do not render a false divider.
+    // Show the raw tool call when the user's name ends with "(debugging)".
     const swapToolShortName = getSwapToolShortName({
       toolName,
       getToolShortName,
     });
-    if (
-      !isDebugging &&
-      (swapToolShortName === TOOL_SWAP_AGENT_SHORT_NAME ||
-        swapToolShortName === TOOL_SWAP_TO_DEFAULT_AGENT_SHORT_NAME)
-    ) {
-      return null;
+    const isSwapTool =
+      swapToolShortName === TOOL_SWAP_AGENT_SHORT_NAME ||
+      swapToolShortName === TOOL_SWAP_TO_DEFAULT_AGENT_SHORT_NAME;
+    if (!isDebugging && isSwapTool) {
+      return errorText ? (
+        <CompactToolGroup
+          tools={[
+            {
+              key: part.toolCallId ?? toolName,
+              toolName,
+              part,
+              toolResultPart,
+              errorText,
+            },
+          ]}
+          toolIconMap={toolIconMap}
+          canExpandToolCalls={canExpandToolCalls}
+          onToolApprovalResponse={onToolApprovalResponse}
+        />
+      ) : null;
     }
 
     if (getToolShortName(toolName) === TOOL_TODO_WRITE_SHORT_NAME) {
@@ -1698,6 +1824,39 @@ function isSwapAgentPokeMessage(message: UIMessage): boolean {
     text === SWAP_TO_DEFAULT_AGENT_POKE_TEXT ||
     text.startsWith(SWAP_AGENT_POKE_PREFIX)
   );
+}
+
+function getPreviousAssistantSwapBoundaryLabel({
+  messages,
+  beforeIndex,
+  getToolShortName,
+  hasToolError,
+}: {
+  messages: UIMessage[];
+  beforeIndex: number;
+  getToolShortName?: (toolName: string) => ArchestraToolShortName | null;
+  hasToolError: (part: SwapToolPart, allParts: SwapToolPart[]) => boolean;
+}) {
+  for (let i = beforeIndex - 1; i >= 0; i--) {
+    const previousMessage = messages[i];
+    if (previousMessage.role === "user") {
+      return null;
+    }
+    if (previousMessage.role !== "assistant") {
+      continue;
+    }
+
+    const label = getSwapAgentBoundaryLabel({
+      parts: previousMessage.parts ?? [],
+      getToolShortName,
+      hasToolError,
+    });
+    if (label) {
+      return label;
+    }
+  }
+
+  return null;
 }
 
 function renderPartWithUnsafeContextDivider({
@@ -2180,6 +2339,76 @@ function hasMessageAuthToolError(message: UIMessage): boolean {
       ];
     }),
   );
+}
+
+function buildMessageTimeline(params: {
+  messages: UIMessage[];
+  chatErrors: PersistedChatError[];
+}): TimelineItem[] {
+  const sortedChatErrors = [...params.chatErrors].sort(
+    (a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt),
+  );
+  const timelineItems: TimelineItem[] = [];
+  let errorIndex = 0;
+
+  params.messages.forEach((message, messageIndex) => {
+    const messageCreatedAt = getMessageCreatedAt(message);
+    while (
+      errorIndex < sortedChatErrors.length &&
+      messageCreatedAt !== null &&
+      Date.parse(sortedChatErrors[errorIndex].createdAt) <= messageCreatedAt
+    ) {
+      timelineItems.push({
+        kind: "chat-error",
+        chatError: sortedChatErrors[errorIndex],
+      });
+      errorIndex++;
+    }
+
+    timelineItems.push({ kind: "message", message, messageIndex });
+  });
+
+  for (; errorIndex < sortedChatErrors.length; errorIndex++) {
+    timelineItems.push({
+      kind: "chat-error",
+      chatError: sortedChatErrors[errorIndex],
+    });
+  }
+
+  return timelineItems;
+}
+
+function getMessageCreatedAt(message: UIMessage): number | null {
+  const metadata = message.metadata;
+  if (
+    typeof metadata === "object" &&
+    metadata !== null &&
+    "createdAt" in metadata &&
+    typeof metadata.createdAt === "string"
+  ) {
+    const createdAt = Date.parse(metadata.createdAt);
+    return Number.isNaN(createdAt) ? null : createdAt;
+  }
+
+  return null;
+}
+
+function getInlineErrorMessage(error: Error): string {
+  try {
+    const parsed = JSON.parse(error.message);
+    if (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      "message" in parsed &&
+      typeof parsed.message === "string"
+    ) {
+      return parsed.message;
+    }
+  } catch {
+    // Plain client-side errors are not JSON-encoded.
+  }
+
+  return error.message;
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: Tool parts have dynamic structure

@@ -18,6 +18,7 @@ import {
   organizationKeys,
   useOrganization,
   useUpdateAppearanceSettings,
+  useUpdateAuthSettings,
 } from "@/lib/organization.query";
 import { useOrgTheme } from "@/lib/theme.hook";
 import { ChatLinksEditor } from "./_components/chat-links-editor";
@@ -30,6 +31,13 @@ import { ChatPlaceholdersEditor } from "./_components/chat-placeholders-editor";
 import { FaviconUpload } from "./_components/favicon-upload";
 import { IconLogoUpload } from "./_components/icon-logo-upload";
 import { LogoUpload } from "./_components/logo-upload";
+import { OAuthTokenLifetimeSection } from "./_components/oauth-token-lifetime-section";
+import { OnboardingWizardEditor } from "./_components/onboarding-wizards-editor";
+import {
+  type OnboardingWizardValue,
+  sanitizeOnboardingWizard,
+  validateOnboardingWizard,
+} from "./_components/onboarding-wizards-editor.utils";
 import { OrganizationTokenSection } from "./_components/organization-token-section";
 import { ThemeSelector } from "./_components/theme-selector";
 
@@ -37,6 +45,10 @@ export default function OrganizationSettingsPage() {
   const updateMutation = useUpdateAppearanceSettings(
     "Organization settings updated",
     "Failed to update organization settings",
+  );
+  const updateAuthSettingsMutation = useUpdateAuthSettings(
+    "Auth settings updated",
+    "Failed to update Auth settings",
   );
   const [hasThemeChanges, setHasThemeChanges] = useState(false);
   const queryClient = useQueryClient();
@@ -78,6 +90,14 @@ export default function OrganizationSettingsPage() {
   );
   const [showChatLinkValidationErrors, setShowChatLinkValidationErrors] =
     useState(false);
+  // `undefined` = untouched (fall back to server value), `null` = explicitly cleared
+  const [onboardingWizardDraft, setOnboardingWizardDraft] = useState<
+    OnboardingWizardValue | null | undefined
+  >(undefined);
+  const [
+    showOnboardingWizardValidationErrors,
+    setShowOnboardingWizardValidationErrors,
+  ] = useState(false);
   const [chatErrorSupportMessage, setChatErrorSupportMessage] = useState<
     string | null
   >(null);
@@ -96,6 +116,18 @@ export default function OrganizationSettingsPage() {
     ogDescription ?? organization?.ogDescription ?? "";
   const effectiveFooterText = footerText ?? organization?.footerText ?? "";
   const effectiveChatLinks = chatLinks ?? organization?.chatLinks ?? [];
+  const effectiveOnboardingWizard: OnboardingWizardValue | null =
+    onboardingWizardDraft !== undefined
+      ? onboardingWizardDraft
+      : organization?.onboardingWizard
+        ? {
+            label: organization.onboardingWizard.label,
+            pages: organization.onboardingWizard.pages.map((page) => ({
+              image: page.image ?? null,
+              content: page.content,
+            })),
+          }
+        : null;
   const effectiveChatErrorSupportMessage =
     chatErrorSupportMessage ?? organization?.chatErrorSupportMessage ?? "";
   const effectiveSlimChatErrorUi =
@@ -122,11 +154,30 @@ export default function OrganizationSettingsPage() {
     (errors) => !!errors.label || !!errors.url,
   );
 
+  const liveOnboardingWizardValidationError = validateOnboardingWizard(
+    effectiveOnboardingWizard,
+  );
+  const saveOnboardingWizardValidationError = validateOnboardingWizard(
+    effectiveOnboardingWizard,
+    { requireComplete: true },
+  );
+  const hasLiveOnboardingWizardValidationError =
+    !!liveOnboardingWizardValidationError.label ||
+    !!liveOnboardingWizardValidationError.pages;
+  const displayedOnboardingWizardValidationError =
+    showOnboardingWizardValidationErrors
+      ? saveOnboardingWizardValidationError
+      : liveOnboardingWizardValidationError;
+  const hasOnboardingWizardValidationError =
+    !!saveOnboardingWizardValidationError.label ||
+    !!saveOnboardingWizardValidationError.pages;
+
   const hasFieldChanges =
     appName !== null ||
     ogDescription !== null ||
     footerText !== null ||
     chatLinks !== null ||
+    onboardingWizardDraft !== undefined ||
     chatErrorSupportMessage !== null ||
     slimChatErrorUi !== null ||
     chatPlaceholders !== null ||
@@ -143,6 +194,9 @@ export default function OrganizationSettingsPage() {
       data.chatLinks =
         sanitizedChatLinks.length > 0 ? sanitizedChatLinks : null;
     }
+    if (onboardingWizardDraft !== undefined) {
+      data.onboardingWizard = sanitizeOnboardingWizard(onboardingWizardDraft);
+    }
     if (chatErrorSupportMessage !== null) {
       data.chatErrorSupportMessage = chatErrorSupportMessage.trim() || null;
     }
@@ -155,8 +209,6 @@ export default function OrganizationSettingsPage() {
     if (animateChatPlaceholders !== null) {
       data.animateChatPlaceholders = animateChatPlaceholders;
     }
-    if (showTwoFactor !== null) data.showTwoFactor = showTwoFactor;
-
     const updatedOrganization = await updateMutation.mutateAsync(data);
     if (!updatedOrganization) {
       return;
@@ -168,10 +220,27 @@ export default function OrganizationSettingsPage() {
     setFooterText(null);
     setChatLinks(null);
     setShowChatLinkValidationErrors(false);
+    setOnboardingWizardDraft(undefined);
+    setShowOnboardingWizardValidationErrors(false);
     setChatErrorSupportMessage(null);
     setSlimChatErrorUi(null);
     setChatPlaceholders(null);
     setAnimateChatPlaceholders(null);
+    setShowTwoFactor(null);
+  };
+
+  const handleSaveAuthFields = async () => {
+    if (showTwoFactor === null) {
+      return;
+    }
+
+    const updatedOrganization = await updateAuthSettingsMutation.mutateAsync({
+      showTwoFactor,
+    });
+    if (!updatedOrganization) {
+      return;
+    }
+
     setShowTwoFactor(null);
   };
 
@@ -263,6 +332,22 @@ export default function OrganizationSettingsPage() {
                 validationErrors={displayedChatLinkValidationErrors}
                 onChange={setChatLinks}
               />
+              <OnboardingWizardEditor
+                wizard={effectiveOnboardingWizard}
+                validationError={displayedOnboardingWizardValidationError}
+                onChange={setOnboardingWizardDraft}
+                onPersist={async (sanitized) => {
+                  const result = await updateMutation.mutateAsync({
+                    onboardingWizard: sanitized,
+                  });
+                  if (!result) return false;
+                  // Clear the draft so the settings save bar no longer flags
+                  // onboarding as dirty.
+                  setOnboardingWizardDraft(undefined);
+                  setShowOnboardingWizardValidationErrors(false);
+                  return true;
+                }}
+              />
               <div className="space-y-2">
                 <Label htmlFor="chatErrorSupportMessage">
                   Support Contact Message
@@ -327,8 +412,10 @@ export default function OrganizationSettingsPage() {
 
       {/* Auth Section */}
       <div>
-        <h3 className="text-lg font-medium mb-4">Authentication</h3>
+        <h3 className="text-lg font-medium mb-4">Auth</h3>
         <SettingsSectionStack>
+          <OAuthTokenLifetimeSection />
+
           <Card>
             <SettingsCardHeader
               title="Two-Factor Authentication"
@@ -350,11 +437,17 @@ export default function OrganizationSettingsPage() {
       {/* Unified save bar for all changes (theme + fields) */}
       <SettingsSaveBar
         hasChanges={hasThemeChanges || hasFieldChanges}
-        isSaving={updateMutation.isPending}
+        isSaving={
+          updateMutation.isPending || updateAuthSettingsMutation.isPending
+        }
         permissions={{ organizationSettings: ["update"] }}
         onSave={async () => {
           if (hasFieldChanges && hasChatLinkValidationErrors) {
             setShowChatLinkValidationErrors(true);
+            return;
+          }
+          if (hasFieldChanges && hasOnboardingWizardValidationError) {
+            setShowOnboardingWizardValidationErrors(true);
             return;
           }
 
@@ -362,7 +455,21 @@ export default function OrganizationSettingsPage() {
             await saveAppearance?.(currentUITheme || DEFAULT_THEME);
             setHasThemeChanges(false);
           }
-          if (hasFieldChanges) {
+          if (hasFieldChanges && showTwoFactor !== null) {
+            await handleSaveAuthFields();
+          }
+          if (
+            hasFieldChanges &&
+            (appName !== null ||
+              ogDescription !== null ||
+              footerText !== null ||
+              chatLinks !== null ||
+              onboardingWizardDraft !== undefined ||
+              chatErrorSupportMessage !== null ||
+              slimChatErrorUi !== null ||
+              chatPlaceholders !== null ||
+              animateChatPlaceholders !== null)
+          ) {
             await handleSaveFields();
           }
         }}
@@ -376,12 +483,17 @@ export default function OrganizationSettingsPage() {
           setFooterText(null);
           setChatLinks(null);
           setShowChatLinkValidationErrors(false);
+          setOnboardingWizardDraft(undefined);
+          setShowOnboardingWizardValidationErrors(false);
           setChatErrorSupportMessage(null);
           setChatPlaceholders(null);
           setAnimateChatPlaceholders(null);
           setShowTwoFactor(null);
         }}
-        disabledSave={hasLiveChatLinkValidationErrors}
+        disabledSave={
+          hasLiveChatLinkValidationErrors ||
+          hasLiveOnboardingWizardValidationError
+        }
       />
     </SettingsSectionStack>
   );
